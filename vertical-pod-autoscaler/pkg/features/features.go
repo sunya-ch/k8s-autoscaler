@@ -61,6 +61,14 @@ const (
 	// InPlace enables the InPlace update mode to be used.
 	// Requires KEP-1287 InPlacePodVerticalScaling feature-gate to be enabled on the cluster.
 	InPlace featuregate.Feature = "InPlace"
+
+	// alpha: v1.8.0
+	// components: admission-controller, updater
+
+	// DRARecreate enables DRA (Dynamic Resource Allocation) ResourceClaim
+	// support with consumable capacity management. This allows VPA to manage
+	// DRA resources and update ResourceClaims when recommendations change.
+	DRARecreate featuregate.Feature = "DRARecreate"
 )
 
 // MutableFeatureGate is a mutable, versioned, global FeatureGate.

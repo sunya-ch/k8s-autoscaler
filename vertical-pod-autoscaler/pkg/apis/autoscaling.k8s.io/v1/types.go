@@ -19,6 +19,7 @@ package v1
 import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -214,7 +215,7 @@ type PodUpdatePolicy struct {
 }
 
 // UpdateMode controls when autoscaler applies changes to the pod resources.
-// +kubebuilder:validation:Enum=Off;Initial;Recreate;InPlaceOrRecreate;InPlace;Auto
+// +kubebuilder:validation:Enum=Off;Initial;Recreate;InPlaceOrRecreate;InPlace;Auto;DRARecreate
 type UpdateMode string
 
 const (
@@ -250,6 +251,13 @@ const (
 	// on the admission and updater pods
 	// Requires cluster feature gate "InPlacePodVerticalScaling" to be enabled.
 	UpdateModeInPlace UpdateMode = "InPlace"
+	// UpdateModeDRARecreate means that autoscaler assigns DRA resources on pod
+	// creation and additionally can update them during the lifetime of the
+	// pod by deleting and recreating the pod, including DRA ResourceClaim recreate.
+	// Requires VPA level feature gate "DRARecreate" to be enabled
+	// on the admission and updater pods
+	// Requires cluster feature gate "DRAConsumableCapacity" to be enabled.
+	UpdateModeDRARecreate UpdateMode = "DRARecreate"
 )
 
 // PodResourcePolicy controls how autoscaler computes the recommended resources
@@ -262,6 +270,12 @@ type PodResourcePolicy struct {
 	// +patchMergeKey=containerName
 	// +patchStrategy=merge
 	ContainerPolicies []ContainerResourcePolicy `json:"containerPolicies,omitempty" patchStrategy:"merge" patchMergeKey:"containerName"`
+
+	// ResourceClaimPolicies configures DRA ResourceClaim management for this pod.
+	// Maps extended resource recommendations (from external recommender) to DRA capacity targets.
+	// ResourceClaims are pod-level resources, not container-level.
+	// +optional
+	ResourceClaimPolicies []ResourceClaimPolicy `json:"resourceClaimPolicies,omitempty"`
 }
 
 // ContainerResourcePolicy controls how autoscaler computes the recommended
@@ -356,6 +370,40 @@ const (
 	// ContainerControlledValuesRequestsOnly means only requested resource is autoscaled.
 	ContainerControlledValuesRequestsOnly ContainerControlledValues = "RequestsOnly"
 )
+
+// ResourceClaimPolicy defines the policy for managing DRA resources in a pod.
+// +kubebuilder:validation:XValidation:rule="has(self.controlledCapacities) && size(self.controlledCapacities) > 0",message="controlledCapacities must contain at least one capacity name"
+type ResourceClaimPolicy struct {
+	// ClaimTemplateName is the name of the ResourceClaimTemplate referenced in the pod spec.
+	// Must match a template name in pod.spec.resourceClaims[].resourceClaimTemplateName.
+	// +required
+	ClaimTemplateName string `json:"claimTemplateName"`
+
+	// DeviceClassName specifies which device class to target in the ResourceClaimTemplate.
+	// Must match the deviceClassName in the ResourceClaimTemplate's device requests.
+	// +required
+	DeviceClassName string `json:"deviceClassName"`
+
+	// Specifies the minimal amount of capacities that will be recommended
+	// for the container. The default is no minimum.
+	// Keys are bare capacity names (e.g. "memory"), not the full "deviceClass/capacity" form.
+	// +optional
+	MinAllowed corev1.ResourceList `json:"minAllowed,omitempty"`
+	// Specifies the maximum amount of capacities that will be recommended
+	// for the container. The default is no maximum.
+	// Keys are bare capacity names (e.g. "memory"), not the full "deviceClass/capacity" form.
+	// +optional
+	MaxAllowed corev1.ResourceList `json:"maxAllowed,omitempty"`
+
+	// Specifies which device capacities are controlled (and possibly applied) by VPA.
+	// Each entry is the bare capacity name as it appears in the ResourceClaim's
+	// spec.devices.requests[].exactly.capacity.requests map (e.g. "memory", not
+	// "deviceClass/memory"). Must contain at least one entry.
+	// +required
+	// +kubebuilder:validation:MinItems=1
+	// +patchStrategy=merge
+	ControlledCapacities []resourceapi.QualifiedName `json:"controlledCapacities" patchStrategy:"merge"`
+}
 
 // VerticalPodAutoscalerStatus describes the runtime state of the autoscaler.
 type VerticalPodAutoscalerStatus struct {

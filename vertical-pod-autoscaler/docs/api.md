@@ -147,6 +147,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `containerPolicies` _[ContainerResourcePolicy](#containerresourcepolicy) array_ | Per-container resource policies. |  | Optional: \{\} <br /> |
+| `resourceClaimPolicies` _[ResourceClaimPolicy](#resourceclaimpolicy) array_ | ResourceClaimPolicies configures DRA ResourceClaim management for this pod.<br />Maps extended resource recommendations (from external recommender) to DRA capacity targets.<br />ResourceClaims are pod-level resources, not container-level. |  | Optional: \{\} <br /> |
 
 
 #### PodUpdatePolicy
@@ -162,7 +163,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `updateMode` _[UpdateMode](#updatemode)_ | Controls when autoscaler applies changes to the pod resources.<br />The default is 'Recreate'. |  | Enum: [Off Initial Recreate InPlaceOrRecreate InPlace Auto] <br />Optional: \{\} <br /> |
+| `updateMode` _[UpdateMode](#updatemode)_ | Controls when autoscaler applies changes to the pod resources.<br />The default is 'Recreate'. |  | Enum: [Off Initial Recreate InPlaceOrRecreate InPlace Auto DRARecreate] <br />Optional: \{\} <br /> |
 | `minReplicas` _integer_ | Minimal number of replicas which need to be alive for Updater to attempt<br />pod eviction (pending other checks like PDB). Only positive values are<br />allowed. Overrides global '--min-replicas' flag. |  | Optional: \{\} <br /> |
 | `evictionRequirements` _[EvictionRequirement](#evictionrequirement) array_ | EvictionRequirements is a list of EvictionRequirements that need to<br />evaluate to true in order for a Pod to be evicted. If more than one<br />EvictionRequirement is specified, all of them need to be fulfilled to allow eviction. |  | Optional: \{\} <br /> |
 | `evictAfterOOMSeconds` _integer_ | evictAfterOOMSeconds specifies the time in seconds to wait after an OOM event before<br />considering the pod for eviction. Pods that have OOMed in less than this time<br />since start will be evicted. |  | Minimum: 1 <br />Optional: \{\} <br /> |
@@ -209,6 +210,26 @@ _Appears in:_
 | `containerRecommendations` _[RecommendedContainerResources](#recommendedcontainerresources) array_ | Resources recommended by the autoscaler for each container. |  | Optional: \{\} <br /> |
 
 
+#### ResourceClaimPolicy
+
+
+
+ResourceClaimPolicy defines the policy for managing DRA resources in a pod.
+
+
+
+_Appears in:_
+- [PodResourcePolicy](#podresourcepolicy)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `claimTemplateName` _string_ | ClaimTemplateName is the name of the ResourceClaimTemplate referenced in the pod spec.<br />Must match a template name in pod.spec.resourceClaims[].resourceClaimTemplateName. |  | Required: \{\} <br /> |
+| `deviceClassName` _string_ | DeviceClassName specifies which device class to target in the ResourceClaimTemplate.<br />Must match the deviceClassName in the ResourceClaimTemplate's device requests. |  | Required: \{\} <br /> |
+| `minAllowed` _[ResourceList](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#resourcelist-v1-core)_ | Specifies the minimal amount of capacities that will be recommended<br />for the container. The default is no minimum.<br />Keys are bare capacity names (e.g. "memory"), not the full "deviceClass/capacity" form. |  | Optional: \{\} <br /> |
+| `maxAllowed` _[ResourceList](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#resourcelist-v1-core)_ | Specifies the maximum amount of capacities that will be recommended<br />for the container. The default is no maximum.<br />Keys are bare capacity names (e.g. "memory"), not the full "deviceClass/capacity" form. |  | Optional: \{\} <br /> |
+| `controlledCapacities` _[QualifiedName](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.36/#qualifiedname-v1-resource) array_ | Specifies which device capacities are controlled (and possibly applied) by VPA.<br />Each entry is the bare capacity name as it appears in the ResourceClaim's<br />spec.devices.requests[].exactly.capacity.requests map (e.g. "memory", not<br />"deviceClass/memory"). Must contain at least one entry. |  | MinItems: 1 <br />Required: \{\} <br /> |
+
+
 #### StartupBoost
 
 
@@ -251,7 +272,7 @@ _Underlying type:_ _string_
 UpdateMode controls when autoscaler applies changes to the pod resources.
 
 _Validation:_
-- Enum: [Off Initial Recreate InPlaceOrRecreate InPlace Auto]
+- Enum: [Off Initial Recreate InPlaceOrRecreate InPlace Auto DRARecreate]
 
 _Appears in:_
 - [PodUpdatePolicy](#podupdatepolicy)
@@ -264,6 +285,7 @@ _Appears in:_
 | `Auto` | UpdateModeAuto means that autoscaler assigns resources on pod creation<br />and additionally can update them during the lifetime of the pod,<br />using any available update method. Currently this is equivalent to<br />Recreate.<br />Deprecated: This value is deprecated and will be removed in a future API version.<br />Use explicit update modes like "Recreate", "Initial", or "InPlaceOrRecreate" instead.<br />See https://github.com/kubernetes/autoscaler/issues/8424 for more details.<br /> |
 | `InPlaceOrRecreate` | UpdateModeInPlaceOrRecreate means that autoscaler tries to assign resources in-place.<br />If this is not possible (e.g., resizing takes too long or is infeasible), it falls back to the<br />"Recreate" update mode.<br />Requires cluster feature gate "InPlacePodVerticalScaling" to be enabled.<br /> |
 | `InPlace` | UpdateModeInPlace means that autoscaler will only attempt to update pods in-place<br />and will never evict them. If in-place update fails, autoscaler will rely on<br />Kubelet's automatic retry mechanism.<br />Requires VPA level feature gate "InPlace" to be enabled<br />on the admission and updater pods<br />Requires cluster feature gate "InPlacePodVerticalScaling" to be enabled.<br /> |
+| `DRARecreate` | UpdateModeDRARecreate means that autoscaler assigns DRA resources on pod<br />creation and additionally can update them during the lifetime of the<br />pod by deleting and recreating the pod, including DRA ResourceClaim recreate.<br />Requires VPA level feature gate "DRARecreate" to be enabled<br />on the admission and updater pods<br />Requires cluster feature gate "DRAConsumableCapacity" to be enabled.<br /> |
 
 
 #### VerticalPodAutoscaler
