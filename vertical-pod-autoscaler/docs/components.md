@@ -99,10 +99,14 @@ before pod with 20% memory increase and no change in cpu).
 ## Admission-controller
 
 This is a binary that registers itself as a Mutating Admission Webhook
-and because of that is on the path of creating all pods.
+and because of that is on the path of creating all pods and ResourceClaims.
 For each pod creation, it will get a request from the apiserver and it will
 either decide there's no matching VPA configuration or find the corresponding
 one and use current recommendation to set resource requests in the pod.
+
+For ResourceClaim creation (Dynamic Resource Allocation), the admission controller
+patches the capacity requests based on VPA recommendations before the ResourceClaim
+is stored. This is necessary because ResourceClaim capacity is immutable after creation.
 
 ### Running the admission-controller
 

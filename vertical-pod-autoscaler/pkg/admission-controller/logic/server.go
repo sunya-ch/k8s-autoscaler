@@ -34,6 +34,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/patch"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/resourceclaim"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/vpa"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
@@ -66,8 +67,10 @@ func NewAdmissionServer(podPreProcessor pod.PreProcessor,
 	vpaMatcher vpa.Matcher,
 	patchCalculators []patch.Calculator) *AdmissionServer {
 	as := &AdmissionServer{limitsChecker, map[metav1.GroupResource]resource.Handler{}}
-	as.RegisterResourceHandler(pod.NewResourceHandler(podPreProcessor, vpaMatcher, patchCalculators))
+	vpaCache := pod.NewVpaCache()
+	as.RegisterResourceHandler(pod.NewResourceHandler(podPreProcessor, vpaMatcher, patchCalculators, vpaCache))
 	as.RegisterResourceHandler(vpa.NewResourceHandler(vpaPreProcessor))
+	as.RegisterResourceHandler(resourceclaim.NewResourceHandler(vpaCache, patchCalculators))
 	return as
 }
 

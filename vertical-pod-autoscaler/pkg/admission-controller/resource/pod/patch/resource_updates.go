@@ -65,9 +65,11 @@ func (c *resourcesUpdatesPatchCalculator) CalculatePatches(pod *corev1.Pod, vpa 
 		return []resource_admission.PatchRecord{}, fmt.Errorf("failed to calculate resource patch for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 	}
 
-	if vpa_api_util.GetUpdateMode(vpa) == vpa_types.UpdateModeOff {
-		// If update mode is "Off", we don't want to apply any recommendations,
-		// but we still want to apply startup boost.
+	updateMode := vpa_api_util.GetUpdateMode(vpa)
+	if updateMode == vpa_types.UpdateModeOff || updateMode == vpa_types.UpdateModeDRARecreate {
+		// If update mode is "Off" or "DRARecreate", we don't want to apply container resource recommendations.
+		// - "Off": No recommendations should be applied, but startup boost may still be applied.
+		// - "DRARecreate": Only DRA resources (via ResourceClaims) should be updated, not container resources.
 		for i := range containersResources {
 			containersResources[i].Requests = nil
 			containersResources[i].Limits = nil
