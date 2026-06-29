@@ -340,6 +340,65 @@ var _ = UpdaterE2eDescribe("Updater", func() {
 		err = WaitForPodsUpdatedWithoutEviction(f, podsAfterFirstUpdate)
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	})
+	framework.Context("with DRARecreate mode", framework.WithFeatureGate(features.DRARecreate), func() {
+		// Sets up a lease object updated periodically to signal - requires WithSerial()
+		framework.It("evicts pods when DRA recommendations change", framework.WithSerial(), func() {
+			const statusUpdateInterval = 10 * time.Second
+
+			ginkgo.By("Setting up the Admission Controller status")
+			stopCh := make(chan struct{})
+			statusUpdater := status.NewUpdater(
+				f.ClientSet,
+				status.AdmissionControllerStatusName,
+				utils.VpaNamespace,
+				statusUpdateInterval,
+				"e2e test",
+			)
+			defer func() {
+				ginkgo.By("Deleting the Admission Controller status")
+				close(stopCh)
+				err := f.ClientSet.CoordinationV1().Leases(utils.VpaNamespace).
+					Delete(context.TODO(), status.AdmissionControllerStatusName, metav1.DeleteOptions{})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			}()
+			statusUpdater.Run(stopCh)
+
+			podList := setupPodsWithResourceClaimForEviction(f, vpa_types.UpdateModeDRARecreate)
+
+			ginkgo.By("Waiting for pods to be evicted due to DRA recommendation change")
+			err := WaitForPodsEvicted(f, podList)
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		})
+
+		// Sets up a lease object updated periodically to signal - requires WithSerial()
+		framework.It("does not evict pods when DRA recommendations don't change", framework.WithSerial(), func() {
+			const statusUpdateInterval = 10 * time.Second
+
+			ginkgo.By("Setting up the Admission Controller status")
+			stopCh := make(chan struct{})
+			statusUpdater := status.NewUpdater(
+				f.ClientSet,
+				status.AdmissionControllerStatusName,
+				utils.VpaNamespace,
+				statusUpdateInterval,
+				"e2e test",
+			)
+			defer func() {
+				ginkgo.By("Deleting the Admission Controller status")
+				close(stopCh)
+				err := f.ClientSet.CoordinationV1().Leases(utils.VpaNamespace).
+					Delete(context.TODO(), status.AdmissionControllerStatusName, metav1.DeleteOptions{})
+				gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			}()
+			statusUpdater.Run(stopCh)
+
+			// Setup pods with ResourceClaim where current capacity matches recommendation
+			podList := setupPodsWithResourceClaimNoChange(f, vpa_types.UpdateModeDRARecreate)
+
+			ginkgo.By(fmt.Sprintf("Waiting for pods to be evicted, hoping it won't happen, sleep for %s", VpaEvictionTimeout.String()))
+			CheckNoPodsEvicted(f, MakePodSet(podList))
+		})
+	})
 })
 
 func setupPodsForUpscalingEviction(f *framework.Framework, updateMode vpa_types.UpdateMode) *apiv1.PodList {
