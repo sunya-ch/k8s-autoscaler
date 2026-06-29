@@ -20,6 +20,7 @@ import (
 	"math"
 
 	corev1 "k8s.io/api/core/v1"
+	listersresourcev1 "k8s.io/client-go/listers/resource/v1"
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -35,14 +36,17 @@ type PriorityProcessor interface {
 }
 
 // NewProcessor creates a new default PriorityProcessor.
-func NewProcessor() PriorityProcessor {
-	return &defaultPriorityProcessor{}
+// claimLister is used to fetch current ResourceClaim capacities for DRARecreate
+// eviction decisions. Pass nil to skip DRA capacity comparison (e.g. in tests).
+func NewProcessor(claimLister listersresourcev1.ResourceClaimLister) PriorityProcessor {
+	return &defaultPriorityProcessor{claimLister: claimLister}
 }
 
 type defaultPriorityProcessor struct {
+	claimLister listersresourcev1.ResourceClaimLister
 }
 
-func (*defaultPriorityProcessor) GetUpdatePriority(pod *corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler,
+func (p *defaultPriorityProcessor) GetUpdatePriority(pod *corev1.Pod, vpa *vpa_types.VerticalPodAutoscaler,
 	recommendation *vpa_types.RecommendedPodResources) PodPriority {
 	outsideRecommendedRange := false
 	scaleUp := false
@@ -52,6 +56,14 @@ func (*defaultPriorityProcessor) GetUpdatePriority(pod *corev1.Pod, vpa *vpa_typ
 	totalRecommendedPerResource := make(map[corev1.ResourceName]int64)
 
 	hasObservedContainers, vpaContainerSet := parseVpaObservedContainers(pod)
+
+	// For DRARecreate mode, pre-fetch the current ResourceClaim capacities for
+	// the pod so the recommendation loop below can compare them like regular
+	// container requests (keyed by "deviceClass/capacityName").
+	var claimRequests corev1.ResourceList
+	if vpa_api_util.GetUpdateMode(vpa) == vpa_types.UpdateModeDRARecreate && p.claimLister != nil {
+		claimRequests = resourcehelpers.ResourceClaimRequests(pod, p.claimLister)
+	}
 
 	for _, podContainer := range pod.Spec.Containers {
 		if hasObservedContainers && !vpaContainerSet.Has(podContainer.Name) {
@@ -66,7 +78,15 @@ func (*defaultPriorityProcessor) GetUpdatePriority(pod *corev1.Pod, vpa *vpa_typ
 			totalRecommendedPerResource[resourceName] += recommended.MilliValue()
 			lowerBound, hasLowerBound := recommendedRequest.LowerBound[resourceName]
 			upperBound, hasUpperBound := recommendedRequest.UpperBound[resourceName]
+
+			// Merge container requests with ResourceClaim capacities. DRA keys
+			// ("deviceClass/capacityName") only appear in claimRequests; CPU/memory
+			// keys only appear in container requests — so a single lookup suffices.
 			requests, _ := resourcehelpers.ContainerRequestsAndLimits(podContainer.Name, pod)
+			for k, v := range claimRequests {
+				requests[k] = v
+			}
+
 			if request, hasRequest := requests[resourceName]; hasRequest {
 				totalRequestPerResource[resourceName] += request.MilliValue()
 				if recommended.MilliValue() > request.MilliValue() {
@@ -81,6 +101,8 @@ func (*defaultPriorityProcessor) GetUpdatePriority(pod *corev1.Pod, vpa *vpa_typ
 				// namespace default request. Currently we ignore it and treat such
 				// containers as if they had 0 request. A more correct approach would
 				// be to always calculate the 'effective' request.
+				// For DRA resources not yet present in the claim, this also
+				// correctly triggers outsideRecommendedRange.
 				scaleUp = true
 				outsideRecommendedRange = true
 			}
@@ -90,6 +112,19 @@ func (*defaultPriorityProcessor) GetUpdatePriority(pod *corev1.Pod, vpa *vpa_typ
 	for resource, totalRecommended := range totalRecommendedPerResource {
 		totalRequest := math.Max(float64(totalRequestPerResource[resource]), 1.0)
 		resourceDiff += math.Abs(totalRequest-float64(totalRecommended)) / totalRequest
+		// For DRA resources, any difference from the recommendation means the
+		// ResourceClaim capacity needs to change — mark the pod as outside range
+		// so it is evicted regardless of lifetime or MinChangePriority thresholds.
+		if claimRequests != nil {
+			if current, hasCurrent := claimRequests[resource]; hasCurrent {
+				if totalRecommended != current.MilliValue() {
+					outsideRecommendedRange = true
+				}
+			} else {
+				// Capacity not yet in the claim — needs update.
+				outsideRecommendedRange = true
+			}
+		}
 	}
 	return PodPriority{
 		OutsideRecommendedRange: outsideRecommendedRange,

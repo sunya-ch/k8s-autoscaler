@@ -581,17 +581,17 @@ func TestAddPodLogs(t *testing.T) {
 		{
 			name:        "container with target and uncappedTarget",
 			givenRec:    test.Recommendation().WithContainer(containerName).WithTarget("4", "10M").Get(),
-			expectedLog: "container1: target: 10000k 4000m; uncappedTarget: 10000k 4000m;",
+			expectedLog: "container1: target: 10000k 4000m ; uncappedTarget: 10000k 4000m ;",
 		},
 		{
 			name:        "container with cpu only",
 			givenRec:    test.Recommendation().WithContainer(containerName).WithTarget("8", "").Get(),
-			expectedLog: "container1: target: 8000m; uncappedTarget: 8000m;",
+			expectedLog: "container1: target: 8000m ; uncappedTarget: 8000m ;",
 		},
 		{
 			name:        "container with memory only",
 			givenRec:    test.Recommendation().WithContainer(containerName).WithTarget("", "10M").Get(),
-			expectedLog: "container1: target: 10000k uncappedTarget: 10000k ",
+			expectedLog: "container1: target: 10000k ; uncappedTarget: 10000k ;",
 		},
 		{
 			name: "multi-container with different resources",
@@ -611,7 +611,7 @@ func TestAddPodLogs(t *testing.T) {
 					},
 				},
 			},
-			expectedLog: "container-1: target: 10000k 4000m; container-2: target: 8000m; container-3: target: 1k ",
+			expectedLog: "container-1: target: 10000k 4000m ; container-2: target: 8000m ; container-3: target: 1k ; ",
 		},
 		{
 			name: "multi-containers with uncappedTarget",
@@ -634,7 +634,24 @@ func TestAddPodLogs(t *testing.T) {
 					},
 				},
 			},
-			expectedLog: "container-1: target: 10000k 4000m; uncappedTarget: 10000k 4000m;container-2: target: 8000m; uncappedTarget: 8000m;container-3: target: 1k uncappedTarget: 1k ",
+			expectedLog: "container-1: target: 10000k 4000m ; uncappedTarget: 10000k 4000m ;container-2: target: 8000m ; uncappedTarget: 8000m ;container-3: target: 1k ; uncappedTarget: 1k ;",
+		},
+		{
+			name: "DRA extended resource capacity",
+			givenRec: &vpa_types.RecommendedPodResources{
+				ContainerRecommendations: []vpa_types.RecommendedContainerResources{
+					{
+						ContainerName: containerName,
+						Target: corev1.ResourceList{
+							"vgpu.example.com/memory": resource.MustParse("16Gi"),
+						},
+						UncappedTarget: corev1.ResourceList{
+							"vgpu.example.com/memory": resource.MustParse("16Gi"),
+						},
+					},
+				},
+			},
+			expectedLog: "container1: target: vgpu.example.com/memory=16Gi ; uncappedTarget: vgpu.example.com/memory=16Gi ;",
 		},
 	}
 	for _, tc := range testCases {

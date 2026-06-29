@@ -38,6 +38,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/patch"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/recommendation"
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	updater_config "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/updater/config"
@@ -51,6 +52,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/server"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/status"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
+	listersresourcev1 "k8s.io/client-go/listers/resource/v1"
 )
 
 const (
@@ -169,10 +171,24 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 
 	ignoredNamespaces := strings.Split(commonFlag.IgnoredVpaObjectNamespaces, ",")
 
-	recommendationProvider := recommendation.NewProvider(limitRangeCalculator, vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalculator))
+	var claimLister listersresourcev1.ResourceClaimLister
+	var processor vpa_api_util.RecommendationProcessor
+	// Create a sequential processor that chains container and DRA capping
+	nativeRequestProcessor := vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalculator)
 
+	if features.Enabled(features.DRARecreate) {
+		claimProcessor := vpa_api_util.NewResourceClaimRecommendationProcessor()
+		processor = vpa_api_util.NewSequentialProcessor([]vpa_api_util.RecommendationProcessor{
+			nativeRequestProcessor, // First: cap container resources (CPU/Memory)
+			claimProcessor,         // Second: cap DRA resources (GPU, etc.)
+		})
+		claimLister = updater.NewResourceClaimLister(kubeClient, commonFlag.VpaObjectNamespace, stopCh)
+	} else {
+		processor = nativeRequestProcessor
+	}
+
+	recommendationProvider := recommendation.NewProvider(limitRangeCalculator, processor)
 	calculators := []patch.Calculator{inplace.NewResourceInPlaceUpdatesCalculator(recommendationProvider), inplace.NewInPlaceUpdatedCalculator(), inplace.NewUnboostAnnotationCalculator()}
-
 	updater, err := updater.NewUpdater(
 		kubeClient,
 		vpaClient,
@@ -188,11 +204,11 @@ func run(healthCheck *metrics.HealthCheck, commonFlag *common.CommonFlags) {
 		config.PodLifetimeUpdateThreshold,
 		config.EvictAfterOOMThreshold,
 		admissionControllerStatusNamespace,
-		vpa_api_util.NewCappingRecommendationProcessor(limitRangeCalculator),
+		processor,
 		priority.NewScalingDirectionPodEvictionAdmission(),
 		targetSelectorFetcher,
 		controllerFetcher,
-		priority.NewProcessor(),
+		priority.NewProcessor(claimLister),
 		commonFlag.VpaObjectNamespace,
 		ignoredNamespaces,
 		calculators,
