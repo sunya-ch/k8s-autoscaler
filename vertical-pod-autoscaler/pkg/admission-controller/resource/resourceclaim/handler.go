@@ -24,6 +24,7 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/klog/v2"
@@ -232,6 +233,11 @@ func translateMetadataPatches(patches []resource_admission.PatchRecord, claim *r
 			})
 			klog.V(4).InfoS("Translated metadata patch (add capacity)",
 				"originalPath", p.Path, "realPath", capPath)
+			// Populate capacity in-memory so subsequent patches for the same request
+			// see it as non-nil and don't emit a duplicate "add capacity" patch.
+			req.Exactly.Capacity = &resourceapi.CapacityRequirements{
+				Requests: map[resourceapi.QualifiedName]resource.Quantity{},
+			}
 			continue
 
 		case req.Exactly.Capacity.Requests == nil:

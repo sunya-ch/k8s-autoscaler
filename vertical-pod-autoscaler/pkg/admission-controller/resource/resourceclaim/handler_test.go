@@ -519,6 +519,47 @@ func TestTranslateMetadataPatches(t *testing.T) {
 				},
 			},
 		},
+		{
+			// Regression test: two capacity patches targeting a nil-Capacity request
+			// must produce one "add capacity" patch followed by one "add key" patch,
+			// not two "add capacity" patches (which would make the second overwrite
+			// the first at apply time).
+			name: "two capacity patches on nil-Capacity request produce distinct patches",
+			patches: []resource_admission.PatchRecord{
+				{Op: "replace", Path: "/resourceClaim/gpu-claim/" + deviceClassName + "/compute", Value: "60"},
+				{Op: "replace", Path: "/resourceClaim/gpu-claim/" + deviceClassName + "/" + capacityName, Value: "16Gi"},
+			},
+			// Use a fresh claim so in-memory mutation from the first patch does not
+			// bleed into other test cases.
+			claim: &resourceapi.ResourceClaim{
+				Spec: resourceapi.ResourceClaimSpec{
+					Devices: resourceapi.DeviceClaim{
+						Requests: []resourceapi.DeviceRequest{
+							{
+								Name: "req0",
+								Exactly: &resourceapi.ExactDeviceRequest{
+									DeviceClassName: deviceClassName,
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []resource_admission.PatchRecord{
+				{
+					Op:   "add",
+					Path: "/spec/devices/requests/0/exactly/capacity",
+					Value: map[string]interface{}{
+						"requests": map[string]interface{}{"compute": "60"},
+					},
+				},
+				{
+					Op:    "add",
+					Path:  "/spec/devices/requests/0/exactly/capacity/requests/" + capacityName,
+					Value: "16Gi",
+				},
+			},
+		},
 	}
 
 	for _, tc := range tests {
