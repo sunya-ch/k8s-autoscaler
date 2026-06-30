@@ -59,7 +59,7 @@ NUMPROC=${NUMPROC:-10}
 
 case ${SUITE} in
   recommender|updater|admission-controller|actuation|full-vpa)
-    export KUBECONFIG=$HOME/.kube/config
+    # export KUBECONFIG=$HOME/.kube/config
     pushd ${SCRIPT_ROOT}/test/e2e
     go install github.com/onsi/ginkgo/v2/ginkgo
     ${GOBIN}/ginkgo build v1/ && ${GOBIN}/ginkgo --nodes=$NUMPROC --focus="\[VPA\] \[${SUITE}\]" v1/v1.test -- --report-dir=${ARTIFACTS} --disable-log-dump ${SKIP}

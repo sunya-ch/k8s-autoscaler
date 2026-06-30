@@ -122,8 +122,10 @@ helm upgrade --install --set args={--kubelet-insecure-tls} metrics-server metric
 # Build and load Docker images for each component
 for COMPONENT in ${COMPONENTS}; do
   ALL_ARCHITECTURES=${ARCH} make --directory "${SCRIPT_ROOT}/pkg/${COMPONENT}" docker-build REGISTRY="${REGISTRY}" TAG="${TAG}"
-  docker tag "${REGISTRY}/vpa-${COMPONENT}-${ARCH}:${TAG}" "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
-  kind load docker-image "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
+  podman tag "${REGISTRY}/vpa-${COMPONENT}-${ARCH}:${TAG}" "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
+  podman save -o image.tar "${REGISTRY}/vpa-${COMPONENT}:${TAG}"
+  kind load image-archive image.tar
+  rm -rf image.tar
 done
 
 
