@@ -928,3 +928,80 @@ func TestCalculatePatches_StartupBoost(t *testing.T) {
 		})
 	}
 }
+
+func TestCalculatePatches_UpdateModes(t *testing.T) {
+	tests := []struct {
+		name               string
+		updateMode         vpa_types.UpdateMode
+		recommendResources []vpa_api_util.ContainerResources
+		expectPatches      int
+	}{
+		{
+			name:       "UpdateModeOff - no container patches",
+			updateMode: vpa_types.UpdateModeOff,
+			recommendResources: []vpa_api_util.ContainerResources{
+				{
+					Requests: corev1.ResourceList{
+						cpu: resource.MustParse("200m"),
+					},
+				},
+			},
+			expectPatches: 0,
+		},
+		{
+			name:       "UpdateModeDRARecreate - no container patches",
+			updateMode: vpa_types.UpdateModeDRARecreate,
+			recommendResources: []vpa_api_util.ContainerResources{
+				{
+					Requests: corev1.ResourceList{
+						cpu: resource.MustParse("200m"),
+					},
+				},
+			},
+			expectPatches: 0,
+		},
+		{
+			name:       "UpdateModeRecreate - applies container patches",
+			updateMode: vpa_types.UpdateModeRecreate,
+			recommendResources: []vpa_api_util.ContainerResources{
+				{
+					Requests: corev1.ResourceList{
+						cpu: resource.MustParse("200m"),
+					},
+				},
+			},
+			expectPatches: 2, // replace cpu request + add annotation
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								cpu: resource.MustParse("100m"),
+							},
+						},
+					}},
+				},
+			}
+
+			frp := fakeRecommendationProvider{tc.recommendResources, vpa_api_util.ContainerToAnnotationsMap{}, nil}
+			c := NewResourceUpdatesCalculator(&frp, resource.QuantityValue{})
+
+			vpa := test.VerticalPodAutoscaler().
+				WithContainer("test").
+				WithName("test-vpa").
+				WithUpdateMode(tc.updateMode).
+				Get()
+
+			patches, err := c.CalculatePatches(pod, vpa)
+			assert.NoError(t, err)
+			assert.Len(t, patches, tc.expectPatches,
+				fmt.Sprintf("UpdateMode %s: expected %d patches, got %d patches: %+v",
+					tc.updateMode, tc.expectPatches, len(patches), patches))
+		})
+	}
+}

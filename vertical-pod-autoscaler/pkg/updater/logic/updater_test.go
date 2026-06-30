@@ -359,7 +359,7 @@ func testRunOnceBase(
 		controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
 		useAdmissionControllerStatus: true,
 		statusValidator:              statusValidator,
-		priorityProcessor:            priority.NewProcessor(),
+		priorityProcessor:            priority.NewProcessor(nil),
 	}
 
 	if expectFetchCalls {
@@ -500,7 +500,7 @@ func TestRunOnceIgnoreNamespaceMatchingPods(t *testing.T) {
 		selectorFetcher:              mockSelectorFetcher,
 		controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
 		useAdmissionControllerStatus: true,
-		priorityProcessor:            priority.NewProcessor(),
+		priorityProcessor:            priority.NewProcessor(nil),
 		ignoredNamespaces:            []string{"not-default"},
 		statusValidator:              newFakeValidator(true),
 	}
@@ -736,7 +736,7 @@ func TestRunOnce_AutoUnboostThenEvict(t *testing.T) {
 		controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
 		useAdmissionControllerStatus: true,
 		statusValidator:              newFakeValidator(true),
-		priorityProcessor:            priority.NewProcessor(),
+		priorityProcessor:            priority.NewProcessor(nil),
 	}
 
 	// Cycle 1: Unboost the cpu
@@ -833,7 +833,7 @@ func TestRunOnce_AutoUnboostThenInPlace(t *testing.T) {
 		controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
 		useAdmissionControllerStatus: true,
 		statusValidator:              newFakeValidator(true),
-		priorityProcessor:            priority.NewProcessor(),
+		priorityProcessor:            priority.NewProcessor(nil),
 	}
 
 	// Cycle 1: Unboost the cpu

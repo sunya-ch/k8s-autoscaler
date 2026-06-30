@@ -31,6 +31,8 @@ const (
 	Pod PatchResourceTarget = "Pod"
 	// Resize refers to the resize subresource of the pod.
 	Resize PatchResourceTarget = "Resize"
+	// ResourceClaim refers to the ResourceClaim objects referenced by the pod.
+	ResourceClaim PatchResourceTarget = "ResourceClaim"
 
 	// Future subresources can be added here.
 	//  e.g. Status PatchResourceTarget = "Status"

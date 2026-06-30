@@ -170,6 +170,14 @@ func selfRegistration(clientset kubernetes.Interface, caCert []byte, webHookDela
 						},
 					},
 					{
+						Operations: []admissionregistration.OperationType{admissionregistration.Create},
+						Rule: admissionregistration.Rule{
+							APIGroups:   []string{"resource.k8s.io"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"resourceclaims"},
+						},
+					},
+					{
 						Operations: []admissionregistration.OperationType{admissionregistration.Create, admissionregistration.Update},
 						Rule: admissionregistration.Rule{
 							APIGroups:   []string{"autoscaling.k8s.io"},

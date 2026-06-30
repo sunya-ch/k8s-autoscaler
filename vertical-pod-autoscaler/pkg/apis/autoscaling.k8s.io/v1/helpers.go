@@ -16,7 +16,10 @@ limitations under the License.
 
 package v1
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+)
 
 // GetUpdateModes returns all UpdateModes
 func GetUpdateModes() map[UpdateMode]any {
@@ -27,6 +30,7 @@ func GetUpdateModes() map[UpdateMode]any {
 		UpdateModeAuto:              nil,
 		UpdateModeInPlaceOrRecreate: nil,
 		UpdateModeInPlace:           nil,
+		UpdateModeDRARecreate:       nil,
 	}
 }
 
@@ -61,4 +65,63 @@ func GetPossibleScalingModes() []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+// GetResourceClaimPolicy returns the ResourceClaimPolicy for a given claim template name.
+// Returns nil if no matching policy is found in the PodResourcePolicy.
+func GetResourceClaimPolicy(claimTemplateName string, policy *PodResourcePolicy) *ResourceClaimPolicy {
+	if policy == nil || len(policy.ResourceClaimPolicies) == 0 {
+		return nil
+	}
+
+	for i := range policy.ResourceClaimPolicies {
+		if policy.ResourceClaimPolicies[i].ClaimTemplateName == claimTemplateName {
+			return &policy.ResourceClaimPolicies[i]
+		}
+	}
+	return nil
+}
+
+// HasResourceClaimPolicies returns true if the VPA has any ResourceClaimPolicies configured.
+func HasResourceClaimPolicies(vpa *VerticalPodAutoscaler) bool {
+	return vpa != nil &&
+		vpa.Spec.ResourcePolicy != nil &&
+		len(vpa.Spec.ResourcePolicy.ResourceClaimPolicies) > 0
+}
+
+// GetResourceClaimPolicyByDeviceClass returns the ResourceClaimPolicy for a given device class.
+// Returns nil if no matching policy is found.
+func GetResourceClaimPolicyByDeviceClass(deviceClassName string, policy *PodResourcePolicy) *ResourceClaimPolicy {
+	if policy == nil || len(policy.ResourceClaimPolicies) == 0 {
+		return nil
+	}
+
+	for i := range policy.ResourceClaimPolicies {
+		if policy.ResourceClaimPolicies[i].DeviceClassName == deviceClassName {
+			return &policy.ResourceClaimPolicies[i]
+		}
+	}
+	return nil
+}
+
+// ValidateResourceClaimPolicy validates a ResourceClaimPolicy for consistency.
+// Returns an error if the policy is invalid.
+func ValidateResourceClaimPolicy(policy *ResourceClaimPolicy) error {
+	if policy == nil {
+		return nil
+	}
+
+	if policy.ClaimTemplateName == "" {
+		return fmt.Errorf("claimTemplateName must not be empty")
+	}
+
+	if policy.DeviceClassName == "" {
+		return fmt.Errorf("deviceClassName must not be empty")
+	}
+
+	if len(policy.ControlledCapacities) == 0 {
+		return fmt.Errorf("controlledCapacities must contain at least one capacity name")
+	}
+
+	return nil
 }

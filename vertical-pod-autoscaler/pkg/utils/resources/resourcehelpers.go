@@ -18,6 +18,7 @@ package resourcehelpers
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	listersresourcev1 "k8s.io/client-go/listers/resource/v1"
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -147,4 +148,42 @@ func HasLowerResource(a, b corev1.ResourceList) bool {
 		}
 	}
 	return false
+}
+
+// ResourceClaimRequests returns a flat ResourceList of the current capacities
+// stored in the ResourceClaims bound to the pod, keyed by the full extended-
+// resource name "deviceClass/capacityName" — the same format used by VPA
+// DRA recommendations.  Claims that cannot be fetched from the lister are
+// silently skipped (the caller should treat missing entries as "needs update").
+func ResourceClaimRequests(pod *corev1.Pod, claimLister listersresourcev1.ResourceClaimLister) corev1.ResourceList {
+	result := corev1.ResourceList{}
+	for _, podClaim := range pod.Spec.ResourceClaims {
+		// Resolve the actual ResourceClaim name from pod status.
+		var claimName string
+		for _, rs := range pod.Status.ResourceClaimStatuses {
+			if rs.Name == podClaim.Name && rs.ResourceClaimName != nil {
+				claimName = *rs.ResourceClaimName
+				break
+			}
+		}
+		if claimName == "" {
+			continue
+		}
+		claim, err := claimLister.ResourceClaims(pod.Namespace).Get(claimName)
+		if err != nil {
+			klog.V(4).InfoS("Could not get ResourceClaim for pod",
+				"pod", klog.KObj(pod), "claim", claimName, "err", err)
+			continue
+		}
+		for _, req := range claim.Spec.Devices.Requests {
+			if req.Exactly == nil || req.Exactly.Capacity == nil {
+				continue
+			}
+			for capName, qty := range req.Exactly.Capacity.Requests {
+				fullName := corev1.ResourceName(req.Exactly.DeviceClassName + "/" + string(capName))
+				result[fullName] = qty
+			}
+		}
+	}
+	return result
 }

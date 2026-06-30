@@ -23,8 +23,13 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	autoscaling "k8s.io/api/autoscaling/v1"
 	apiv1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
@@ -32,6 +37,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/test/e2e/utils"
 	"k8s.io/kubernetes/test/e2e/framework"
 	podsecurity "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/ptr"
 
 	ginkgo "github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -1316,6 +1322,127 @@ var _ = AdmissionControllerE2eDescribe("Admission-controller", func() {
 		pod := podList.Items[0]
 		gomega.Expect(pod.Spec.Containers[0].Resources.Requests.Cpu().Cmp(initialCPU)).To(gomega.Equal(0))
 	})
+
+	f.Context("with DRARecreate mode", framework.WithFeatureGate(features.DRARecreate), func() {
+		f.It("patches ResourceClaim capacity when creating pods", func() {
+			ginkgo.By("Setting up a VPA CRD with DRARecreate mode and DRA recommendations")
+			templateName := "gpu-template"
+			claimName := "gpu-claim"
+			deviceClassName := "vgpu.example.com"
+
+			// Create ResourceClaimTemplate
+			template := &resourcev1.ResourceClaimTemplate{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      templateName,
+					Namespace: f.Namespace.Name,
+				},
+				Spec: resourcev1.ResourceClaimTemplateSpec{
+					Spec: resourcev1.ResourceClaimSpec{
+						Devices: resourcev1.DeviceClaim{
+							Requests: []resourcev1.DeviceRequest{
+								{
+									Name: "memory-request",
+									Exactly: &resourcev1.ExactDeviceRequest{
+										DeviceClassName: deviceClassName,
+										AllocationMode:  resourcev1.DeviceAllocationModeExactCount,
+										Count:           1,
+										Capacity: &resourcev1.CapacityRequirements{
+											Requests: map[resourcev1.QualifiedName]resource.Quantity{
+												"memory": resource.MustParse("8Gi"),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			_, err := f.ClientSet.ResourceV1().ResourceClaimTemplates(f.Namespace.Name).
+				Create(context.TODO(), template, metav1.CreateOptions{})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			containerName := utils.GetHamsterContainerNameByIndex(0)
+			// For DRARecreate mode, the VPA should only contain DRA resource recommendations,
+			// not CPU/memory recommendations
+			vpaCRD := test.VerticalPodAutoscaler().
+				WithName("hamster-vpa").
+				WithNamespace(f.Namespace.Name).
+				WithTargetRef(utils.HamsterTargetRef).
+				WithContainer(containerName).
+				WithUpdateMode(vpa_types.UpdateModeDRARecreate).
+				Get()
+
+			// Add ResourceClaimPolicy
+			vpaCRD.Spec.ResourcePolicy = &vpa_types.PodResourcePolicy{
+				ResourceClaimPolicies: []vpa_types.ResourceClaimPolicy{
+					{
+						ClaimTemplateName: templateName,
+						DeviceClassName:   deviceClassName,
+						MinAllowed: apiv1.ResourceList{
+							"memory": resource.MustParse("4Gi"),
+						},
+						MaxAllowed: apiv1.ResourceList{
+							"memory": resource.MustParse("32Gi"),
+						},
+						ControlledCapacities: []resourcev1.QualifiedName{"memory"},
+					},
+				},
+			}
+
+			// Add DRA-only recommendation (no CPU/memory)
+			vpaCRD.Status.Recommendation = &vpa_types.RecommendedPodResources{
+				ContainerRecommendations: []vpa_types.RecommendedContainerResources{
+					{
+						ContainerName: containerName,
+						Target: apiv1.ResourceList{
+							apiv1.ResourceName(fmt.Sprintf("%s/memory", deviceClassName)): resource.MustParse("16Gi"),
+						},
+						UncappedTarget: apiv1.ResourceList{
+							apiv1.ResourceName(fmt.Sprintf("%s/memory", deviceClassName)): resource.MustParse("16Gi"),
+						},
+					},
+				},
+			}
+
+			utils.InstallVPA(f, vpaCRD)
+
+			ginkgo.By("Setting up a hamster deployment with ResourceClaim")
+			d := NewHamsterDeploymentWithResourceClaim(f, templateName, claimName)
+			podList := utils.StartDeploymentPods(f, d)
+
+			ginkgo.By("Verifying ResourceClaim was patched with recommended capacity by admission controller")
+			gomega.Expect(podList.Items).NotTo(gomega.BeEmpty())
+			pod := podList.Items[0]
+			gomega.Expect(pod.Spec.ResourceClaims).NotTo(gomega.BeEmpty())
+
+			// Kubernetes generates a random-suffixed name for the ResourceClaim
+			// (e.g. "{podName}-{claimName}-{hash}"), so resolve it via pod status.
+			podClaimName := pod.Spec.ResourceClaims[0].Name
+			var actualClaimName string
+			for _, rs := range pod.Status.ResourceClaimStatuses {
+				if rs.Name == podClaimName && rs.ResourceClaimName != nil {
+					actualClaimName = *rs.ResourceClaimName
+					break
+				}
+			}
+			gomega.Expect(actualClaimName).NotTo(gomega.BeEmpty(), "ResourceClaim status not found for pod claim %q", podClaimName)
+
+			claim, err := f.ClientSet.ResourceV1().ResourceClaims(f.Namespace.Name).
+				Get(context.TODO(), actualClaimName, metav1.GetOptions{})
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+			// Verify the capacity was patched to the recommended value (16Gi) by admission controller
+			gomega.Expect(claim.Spec.Devices.Requests).NotTo(gomega.BeEmpty())
+			capacity := claim.Spec.Devices.Requests[0].Exactly.Capacity
+			gomega.Expect(capacity).NotTo(gomega.BeNil())
+
+			memoryCapacity, found := capacity.Requests["memory"]
+			gomega.Expect(found).To(gomega.BeTrue(), "Memory capacity should be present")
+			gomega.Expect(memoryCapacity.String()).To(gomega.Equal("16Gi"), "Memory capacity should be patched to 16Gi by admission controller")
+		})
+	})
 })
 
 func waitForVpaWebhookRegistration(f *framework.Framework) {
@@ -1330,4 +1457,158 @@ func waitForVpaWebhookRegistration(f *framework.Framework) {
 		}
 		return false
 	}, 3*time.Minute, 5*time.Second).Should(gomega.BeTrue(), "Webhook was not registered in the cluster")
+}
+
+// setupPodsWithResourceClaimForEviction sets up pods with ResourceClaims that need eviction
+// Initial capacity: 8Gi, Recommended capacity: 16Gi
+func setupPodsWithResourceClaimForEviction(f *framework.Framework, updateMode vpa_types.UpdateMode) *apiv1.PodList {
+	return setupPodsWithResourceClaim(f, "8Gi", "16Gi", updateMode)
+}
+
+// setupPodsWithResourceClaimNoChange sets up pods with ResourceClaims where capacity matches recommendation
+// Initial capacity: 16Gi, Recommended capacity: 16Gi
+func setupPodsWithResourceClaimNoChange(f *framework.Framework, updateMode vpa_types.UpdateMode) *apiv1.PodList {
+	return setupPodsWithResourceClaim(f, "16Gi", "16Gi", updateMode)
+}
+
+// setupPodsWithResourceClaim sets up pods with ResourceClaims and VPA with DRA recommendations
+func setupPodsWithResourceClaim(f *framework.Framework, initialCapacity, recommendedCapacity string, updateMode vpa_types.UpdateMode) *apiv1.PodList {
+	templateName := "gpu-template"
+	claimName := "gpu-claim"
+	deviceClassName := "vgpu.example.com"
+
+	ginkgo.By("Creating ResourceClaimTemplate")
+	template := &resourcev1.ResourceClaimTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      templateName,
+			Namespace: f.Namespace.Name,
+		},
+		Spec: resourcev1.ResourceClaimTemplateSpec{
+			Spec: resourcev1.ResourceClaimSpec{
+				Devices: resourcev1.DeviceClaim{
+					Requests: []resourcev1.DeviceRequest{
+						{
+							Name: "memory-request",
+							Exactly: &resourcev1.ExactDeviceRequest{
+								DeviceClassName: deviceClassName,
+								AllocationMode:  resourcev1.DeviceAllocationModeExactCount,
+								Count:           1,
+								Capacity: &resourcev1.CapacityRequirements{
+									Requests: map[resourcev1.QualifiedName]resource.Quantity{
+										"memory": resource.MustParse(initialCapacity),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := f.ClientSet.ResourceV1().ResourceClaimTemplates(f.Namespace.Name).
+		Create(context.TODO(), template, metav1.CreateOptions{})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	ginkgo.By("Setting up a deployment with ResourceClaim")
+	d := NewHamsterDeploymentWithResourceClaim(f, templateName, claimName)
+	d, err = f.ClientSet.AppsV1().Deployments(f.Namespace.Name).Create(context.TODO(), d, metav1.CreateOptions{})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	// Wait for pods to be created before capturing the initial pod list.
+	// DRA pods may remain Pending (waiting for device allocation), so we cannot
+	// use WaitForDeploymentComplete which requires Running pods. Instead we poll
+	// until the expected number of pods has been created.
+	ginkgo.By("Waiting for pods to be created")
+	var podList *apiv1.PodList
+	err = wait.PollUntilContextTimeout(context.Background(), 10*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+		podList, err = GetHamsterPods(f)
+		if err != nil {
+			return false, err
+		}
+		return int32(len(podList.Items)) >= *d.Spec.Replicas, nil
+	})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
+
+	controller := &autoscaling.CrossVersionObjectReference{
+		APIVersion: "apps/v1",
+		Kind:       "Deployment",
+		Name:       d.Name,
+	}
+
+	ginkgo.By("Setting up a VPA CRD with DRA recommendations")
+	containerName := utils.GetHamsterContainerNameByIndex(0)
+
+	// For DRARecreate mode, the VPA should only contain DRA resource recommendations,
+	// not CPU/memory recommendations
+	vpaCRD := test.VerticalPodAutoscaler().
+		WithName("hamster-vpa").
+		WithNamespace(f.Namespace.Name).
+		WithTargetRef(controller).
+		WithContainer(containerName).
+		WithUpdateMode(updateMode).
+		Get()
+
+	// Add ResourceClaimPolicy
+	vpaCRD.Spec.ResourcePolicy = &vpa_types.PodResourcePolicy{
+		ResourceClaimPolicies: []vpa_types.ResourceClaimPolicy{
+			{
+				ClaimTemplateName: templateName,
+				DeviceClassName:   deviceClassName,
+				MinAllowed: apiv1.ResourceList{
+					"memory": resource.MustParse("4Gi"),
+				},
+				MaxAllowed: apiv1.ResourceList{
+					"memory": resource.MustParse("32Gi"),
+				},
+				ControlledCapacities: []resourcev1.QualifiedName{"memory"},
+			},
+		},
+	}
+
+	// Add DRA-only recommendation (no CPU/memory)
+	vpaCRD.Status.Recommendation = &vpa_types.RecommendedPodResources{
+		ContainerRecommendations: []vpa_types.RecommendedContainerResources{
+			{
+				ContainerName: containerName,
+				Target: apiv1.ResourceList{
+					apiv1.ResourceName(fmt.Sprintf("%s/memory", deviceClassName)): resource.MustParse(recommendedCapacity),
+				},
+				UncappedTarget: apiv1.ResourceList{
+					apiv1.ResourceName(fmt.Sprintf("%s/memory", deviceClassName)): resource.MustParse(recommendedCapacity),
+				},
+			},
+		},
+	}
+
+	utils.InstallVPA(f, vpaCRD)
+
+	return podList
+}
+
+// NewHamsterDeploymentWithResourceClaim creates a hamster deployment with ResourceClaim
+func NewHamsterDeploymentWithResourceClaim(f *framework.Framework, templateName, claimName string) *appsv1.Deployment {
+	// Use NewHamsterDeploymentWithResourcesAndLimits to set both requests and limits
+	// Limits are required when using ResourceClaims for non-overcommitable resources
+	d := NewHamsterDeploymentWithResourcesAndLimits(f,
+		ParseQuantityOrDie("100m"), ParseQuantityOrDie("100Mi"),
+		ParseQuantityOrDie("100m"), ParseQuantityOrDie("100Mi"))
+
+	// Add ResourceClaim to pod spec
+	d.Spec.Template.Spec.ResourceClaims = []apiv1.PodResourceClaim{
+		{
+			Name:                      claimName,
+			ResourceClaimTemplateName: ptr.To(templateName),
+		},
+	}
+
+	// Add ResourceClaim reference to container
+	d.Spec.Template.Spec.Containers[0].Resources.Claims = []apiv1.ResourceClaim{
+		{
+			Name:    claimName,
+			Request: "memory",
+		},
+	}
+
+	return d
 }

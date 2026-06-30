@@ -37,14 +37,16 @@ type resourceHandler struct {
 	preProcessor     PreProcessor
 	vpaMatcher       vpa.Matcher
 	patchCalculators []patch.Calculator
+	vpaCache         *VpaCache
 }
 
 // NewResourceHandler creates new instance of resourceHandler.
-func NewResourceHandler(preProcessor PreProcessor, vpaMatcher vpa.Matcher, patchCalculators []patch.Calculator) resource_admission.Handler {
+func NewResourceHandler(preProcessor PreProcessor, vpaMatcher vpa.Matcher, patchCalculators []patch.Calculator, vpaCache *VpaCache) resource_admission.Handler {
 	return &resourceHandler{
 		preProcessor:     preProcessor,
 		vpaMatcher:       vpaMatcher,
 		patchCalculators: patchCalculators,
+		vpaCache:         vpaCache,
 	}
 }
 
@@ -84,6 +86,8 @@ func (h *resourceHandler) GetPatches(ctx context.Context, ar *admissionv1.Admiss
 		klog.V(4).InfoS("No matching VPA found for pod", "pod", klog.KObj(&pod))
 		return []resource_admission.PatchRecord{}, nil
 	}
+	klog.V(4).InfoS("Storing VPA in cache for pod", "pod", klog.KObj(&pod), "vpa", klog.KObj(controllingVpa))
+	h.vpaCache.Store(pod.Namespace, pod.Name, controllingVpa, &pod)
 	pod, err := h.preProcessor.Process(pod)
 	if err != nil {
 		return nil, field.ErrorList{field.InternalError(field.NewPath("."), err)}
@@ -94,6 +98,13 @@ func (h *resourceHandler) GetPatches(ctx context.Context, ar *admissionv1.Admiss
 		patches = append(patches, patch.GetAddEmptyAnnotationsPatch())
 	}
 	for _, c := range h.patchCalculators {
+		// Skip calculators that target other resources (e.g. ResourceClaim).
+		// Those patches are handled by their own admission handler and must not
+		// be returned as pod patches — they carry metadata-encoded paths that
+		// would be sent verbatim to the API server if included here.
+		if c.PatchResourceTarget() != patch.Pod && c.PatchResourceTarget() != patch.Resize {
+			continue
+		}
 		partialPatches, err := c.CalculatePatches(&pod, controllingVpa)
 		if err != nil {
 			return []resource_admission.PatchRecord{}, field.ErrorList{field.InternalError(field.NewPath("."), err)}

@@ -21,7 +21,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/cache"
+	listersresourcev1 "k8s.io/client-go/listers/resource/v1"
+	"k8s.io/utils/ptr"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/annotations"
@@ -221,7 +226,7 @@ func TestGetUpdatePriority(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			processor := NewProcessor()
+			processor := NewProcessor(nil)
 			prio := processor.GetUpdatePriority(tc.pod, tc.vpa, tc.vpa.Status.Recommendation)
 			assert.Equal(t, tc.expectedPrio, prio)
 		})
@@ -231,7 +236,7 @@ func TestGetUpdatePriority(t *testing.T) {
 // Verify GetUpdatePriority does not encounter a NPE when there is no
 // recommendation for a container.
 func TestGetUpdatePriority_NoRecommendationForContainer(t *testing.T) {
-	p := NewProcessor()
+	p := NewProcessor(nil)
 	pod := test.Pod().WithName("POD1").AddContainer(test.Container().WithName("test-container").WithCPURequest(resource.MustParse("5")).WithMemRequest(resource.MustParse("10")).Get()).Get()
 	vpa := test.VerticalPodAutoscaler().WithName("test-vpa").WithContainer("test-container").Get()
 	result := p.GetUpdatePriority(pod, vpa, nil)
@@ -284,7 +289,7 @@ func TestGetUpdatePriority_VpaObservedContainers(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			p := NewProcessor()
+			p := NewProcessor(nil)
 			result := p.GetUpdatePriority(tc.pod, testVpa, tc.recommendation)
 			assert.NotNil(t, result)
 			// The resourceDiff should be a difference between container resources
@@ -292,6 +297,139 @@ func TestGetUpdatePriority_VpaObservedContainers(t *testing.T) {
 			// in an existing vpaObservedContainers annotations shouldn't be taken
 			// into account during calculations.
 			assert.InDelta(t, result.ResourceDiff, tc.want, 0.0001)
+		})
+	}
+}
+
+func TestGetUpdatePriority_DRARecreate(t *testing.T) {
+	const (
+		containerName   = "app"
+		deviceClass     = "vgpu.example.com"
+		claimTemplate   = "gpu-template"
+		podClaimName    = "gpu-claim"
+		actualClaimName = "gpu-claim-pod1-abc"
+		namespace       = "default"
+	)
+	draResourceName := corev1.ResourceName(deviceClass + "/memory")
+
+	makeClaim := func(capacity string) *resourcev1.ResourceClaim {
+		var cap *resourcev1.CapacityRequirements
+		if capacity != "" {
+			cap = &resourcev1.CapacityRequirements{
+				Requests: map[resourcev1.QualifiedName]resource.Quantity{
+					"memory": resource.MustParse(capacity),
+				},
+			}
+		}
+		return &resourcev1.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: actualClaimName, Namespace: namespace},
+			Spec: resourcev1.ResourceClaimSpec{
+				Devices: resourcev1.DeviceClaim{
+					Requests: []resourcev1.DeviceRequest{
+						{
+							Name: "memory-request",
+							Exactly: &resourcev1.ExactDeviceRequest{
+								DeviceClassName: deviceClass,
+								Capacity:        cap,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	makePod := func() *corev1.Pod {
+		pod := test.Pod().WithName("POD1").
+			AddContainer(test.Container().WithName(containerName).
+				WithCPURequest(resource.MustParse("100m")).
+				WithMemRequest(resource.MustParse("100Mi")).Get()).
+			Get()
+		pod.Namespace = namespace
+		pod.Spec.ResourceClaims = []corev1.PodResourceClaim{
+			{Name: podClaimName, ResourceClaimTemplateName: ptr.To(claimTemplate)},
+		}
+		pod.Status.ResourceClaimStatuses = []corev1.PodResourceClaimStatus{
+			{Name: podClaimName, ResourceClaimName: ptr.To(actualClaimName)},
+		}
+		return pod
+	}
+
+	makeVPA := func() *vpa_types.VerticalPodAutoscaler {
+		vpa := test.VerticalPodAutoscaler().
+			WithNamespace(namespace).
+			WithUpdateMode(vpa_types.UpdateModeDRARecreate).
+			WithContainer(containerName).
+			Get()
+		vpa.Spec.ResourcePolicy = &vpa_types.PodResourcePolicy{
+			ResourceClaimPolicies: []vpa_types.ResourceClaimPolicy{
+				{
+					ClaimTemplateName:    claimTemplate,
+					DeviceClassName:      deviceClass,
+					ControlledCapacities: []resourcev1.QualifiedName{"memory"},
+				},
+			},
+		}
+		return vpa
+	}
+
+	makeRecommendation := func(capacity string) *vpa_types.RecommendedPodResources {
+		return &vpa_types.RecommendedPodResources{
+			ContainerRecommendations: []vpa_types.RecommendedContainerResources{
+				{
+					ContainerName: containerName,
+					Target: corev1.ResourceList{
+						draResourceName: resource.MustParse(capacity),
+					},
+				},
+			},
+		}
+	}
+
+	makeProcessorWithClaim := func(claimCapacity string) PriorityProcessor {
+		store := cache.NewIndexer(cache.MetaNamespaceKeyFunc,
+			cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+		_ = store.Add(makeClaim(claimCapacity))
+		return NewProcessor(listersresourcev1.NewResourceClaimLister(store))
+	}
+
+	tests := []struct {
+		name             string
+		claimCapacity    string // current capacity in the ResourceClaim
+		recommendedCap   string // VPA recommendation
+		wantOutside      bool
+	}{
+		{
+			name:           "capacity matches recommendation — no eviction",
+			claimCapacity:  "16Gi",
+			recommendedCap: "16Gi",
+			wantOutside:    false,
+		},
+		{
+			name:           "capacity below recommendation — evict",
+			claimCapacity:  "8Gi",
+			recommendedCap: "16Gi",
+			wantOutside:    true,
+		},
+		{
+			name:           "capacity above recommendation — evict",
+			claimCapacity:  "32Gi",
+			recommendedCap: "16Gi",
+			wantOutside:    true,
+		},
+		{
+			name:           "capacity unset in claim — evict",
+			claimCapacity:  "", // nil Capacity
+			recommendedCap: "16Gi",
+			wantOutside:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := makeProcessorWithClaim(tc.claimCapacity)
+			prio := p.GetUpdatePriority(makePod(), makeVPA(), makeRecommendation(tc.recommendedCap))
+			assert.Equal(t, tc.wantOutside, prio.OutsideRecommendedRange, "OutsideRecommendedRange")
 		})
 	}
 }

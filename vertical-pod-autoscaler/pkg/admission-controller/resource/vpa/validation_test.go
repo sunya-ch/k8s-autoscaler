@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/version"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
@@ -257,6 +258,7 @@ func TestValidateVPA(t *testing.T) {
 	controlledValuesRequestsAndLimits := vpa_types.ContainerControlledValuesRequestsAndLimits
 	inPlaceOrRecreateUpdateMode := vpa_types.UpdateModeInPlaceOrRecreate
 	inPlaceUpdateMode := vpa_types.UpdateModeInPlace
+	draRecreateUpdateMode := vpa_types.UpdateModeDRARecreate
 	badCPUBoostFactor := int32(0)
 	validCPUBoostFactor := int32(2)
 	badCPUBoostQuantity := resource.MustParse("187500u")
@@ -307,7 +309,7 @@ func TestValidateVPA(t *testing.T) {
 					},
 				},
 			},
-			expectError: errors.New("spec.updatePolicy.updateMode: Unsupported value: \"bad\": supported values: \"InPlace\", \"InPlaceOrRecreate\", \"Initial\", \"Off\", \"Recreate\""),
+			expectError: errors.New("spec.updatePolicy.updateMode: Unsupported value: \"bad\": supported values: \"DRARecreate\", \"InPlace\", \"InPlaceOrRecreate\", \"Initial\", \"Off\", \"Recreate\""),
 		},
 		{
 			name: "InPlaceOrRecreate update mode set",
@@ -322,6 +324,63 @@ func TestValidateVPA(t *testing.T) {
 					},
 				},
 			},
+		},
+		{
+			name: "DRARecreate update mode set with feature gate disabled",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					UpdatePolicy: &vpa_types.PodUpdatePolicy{
+						UpdateMode: &draRecreateUpdateMode,
+					},
+					TargetRef: &autoscalingv1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: "my-app",
+					},
+				},
+			},
+			expectError: errors.New("spec.updatePolicy.updateMode: Forbidden: in order to use UpdateMode DRARecreate, you must enable feature gate DRARecreate in the admission-controller args"),
+		},
+		{
+			name: "DRARecreate update mode set with feature gate enabled but no resourceClaimPolicies",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					UpdatePolicy: &vpa_types.PodUpdatePolicy{
+						UpdateMode: &draRecreateUpdateMode,
+					},
+					TargetRef: &autoscalingv1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: "my-app",
+					},
+				},
+			},
+			opts:        VPAValidationOptions{AllowDRARecreate: true},
+			expectError: errors.New("spec.resourcePolicy.resourceClaimPolicies: Required value: resourceClaimPolicies must be set when using DRARecreate update mode"),
+		},
+		{
+			name: "DRARecreate update mode set with feature gate enabled and valid resourceClaimPolicies",
+			vpa: vpa_types.VerticalPodAutoscaler{
+				Spec: vpa_types.VerticalPodAutoscalerSpec{
+					UpdatePolicy: &vpa_types.PodUpdatePolicy{
+						UpdateMode: &draRecreateUpdateMode,
+					},
+					TargetRef: &autoscalingv1.CrossVersionObjectReference{
+						Kind: "Deployment",
+						Name: "my-app",
+					},
+					ResourcePolicy: &vpa_types.PodResourcePolicy{
+						ResourceClaimPolicies: []vpa_types.ResourceClaimPolicy{
+							{
+								ClaimTemplateName: "test-claim",
+								DeviceClassName:   "test-device",
+								ControlledCapacities: []resourceapi.QualifiedName{
+									"test-capacity",
+								},
+							},
+						},
+					},
+				},
+			},
+			opts: VPAValidationOptions{AllowDRARecreate: true},
 		},
 		{
 			name: "zero minReplicas",

@@ -189,19 +189,37 @@ func (*UpdatePriorityCalculator) GetProcessedRecommendationTargets(r *vpa_types.
 			}
 			if !cr.Target.Cpu().IsZero() {
 				sb.WriteString(strconv.FormatInt(cr.Target.Cpu().MilliValue(), 10))
-				sb.WriteString("m; ")
+				sb.WriteString("m ")
 			}
+			for name, qty := range cr.Target {
+				if strings.Contains(string(name), "/") {
+					sb.WriteString(string(name))
+					sb.WriteString("=")
+					sb.WriteString(qty.String())
+					sb.WriteString(" ")
+				}
+			}
+			sb.WriteString("; ")
 		}
 		if cr.UncappedTarget != nil {
 			sb.WriteString("uncappedTarget: ")
 			if !cr.UncappedTarget.Memory().IsZero() {
-				sb.WriteString(strconv.FormatInt(cr.Target.Memory().ScaledValue(resource.Kilo), 10))
+				sb.WriteString(strconv.FormatInt(cr.UncappedTarget.Memory().ScaledValue(resource.Kilo), 10))
 				sb.WriteString("k ")
 			}
 			if !cr.UncappedTarget.Cpu().IsZero() {
-				sb.WriteString(strconv.FormatInt(cr.Target.Cpu().MilliValue(), 10))
-				sb.WriteString("m;")
+				sb.WriteString(strconv.FormatInt(cr.UncappedTarget.Cpu().MilliValue(), 10))
+				sb.WriteString("m ")
 			}
+			for name, qty := range cr.UncappedTarget {
+				if strings.Contains(string(name), "/") {
+					sb.WriteString(string(name))
+					sb.WriteString("=")
+					sb.WriteString(qty.String())
+					sb.WriteString(" ")
+				}
+			}
+			sb.WriteString(";")
 		}
 	}
 	return sb.String()

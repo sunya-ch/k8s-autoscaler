@@ -24,6 +24,7 @@ import (
 
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -35,6 +36,7 @@ import (
 	corescheme "k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	listersv1 "k8s.io/client-go/listers/core/v1"
+	listersresourcev1 "k8s.io/client-go/listers/resource/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
@@ -197,8 +199,9 @@ func (u *updater) RunOnce(ctx context.Context) {
 			updateMode != vpa_types.UpdateModeAuto && //nolint:staticcheck
 			updateMode != vpa_types.UpdateModeInPlaceOrRecreate &&
 			updateMode != vpa_types.UpdateModeInPlace &&
+			updateMode != vpa_types.UpdateModeDRARecreate &&
 			!vpa_api_util.HasStartupBoost(vpa) {
-			klog.V(3).InfoS("Skipping VPA object because its mode is not  \"InPlaceOrRecreate\", \"InPlace\", \"Recreate\" or \"Auto\" and it doesn't have startupBoost configured", "vpa", klog.KObj(vpa))
+			klog.V(3).InfoS("Skipping VPA object because its mode is not \"InPlaceOrRecreate\", \"InPlace\", \"Recreate\", \"DRARecreate\", or \"Auto\" and it doesn't have startupBoost configured", "vpa", klog.KObj(vpa))
 			continue
 		}
 		selector, err := u.selectorFetcher.Fetch(ctx, vpa)
@@ -345,7 +348,7 @@ func (u *updater) RunOnce(ctx context.Context) {
 				klog.InfoS("Warning: feature gate is not enabled for this updateMode", "featuregate", features.InPlace, "updateMode", updateMode)
 				continue
 			}
-			// We evict the pod when the mode is set to Recreate or Auto. The latter mode is deprecated.
+			// We evict the pod when the mode is set to Recreate, DRARecreate, or Auto. The latter mode is deprecated.
 			podsForEviction = u.getPodsUpdateOrder(filterNonEvictablePods(podsAvailableForUpdate, evictionLimiter), vpa)
 			evictablePodsCounter.Add(vpaSize, updateMode, len(podsForEviction))
 			if len(podsForEviction) > 0 {
@@ -566,6 +569,17 @@ func NewPodLister(kubeClient kube_client.Interface, namespace string, stopCh <-c
 	go podReflector.Run(stopCh)
 
 	return podLister
+}
+
+// NewResourceClaimLister creates a new ResourceClaimLister that lists ResourceClaims
+// in the given namespace, backed by a reflector-based local cache.
+func NewResourceClaimLister(kubeClient kube_client.Interface, namespace string, stopCh <-chan struct{}) listersresourcev1.ResourceClaimLister {
+	claimListWatch := cache.NewListWatchFromClient(kubeClient.ResourceV1().RESTClient(), "resourceclaims", namespace, fields.Everything())
+	store := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	claimLister := listersresourcev1.NewResourceClaimLister(store)
+	claimReflector := cache.NewReflector(claimListWatch, &resourcev1.ResourceClaim{}, store, time.Hour)
+	go claimReflector.Run(stopCh)
+	return claimLister
 }
 
 func newEventRecorder(kubeClient kube_client.Interface) record.EventRecorder {

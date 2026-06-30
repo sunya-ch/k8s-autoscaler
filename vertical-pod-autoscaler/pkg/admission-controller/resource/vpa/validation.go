@@ -33,6 +33,7 @@ type VPAValidationOptions struct {
 	AllowCPUStartupBoost bool
 	AllowPerVPAConfig    bool
 	AllowInPlace         bool
+	AllowDRARecreate     bool
 }
 
 func getValidationOptionsForVPA(oldObj *vpa_types.VerticalPodAutoscaler) VPAValidationOptions {
@@ -41,6 +42,7 @@ func getValidationOptionsForVPA(oldObj *vpa_types.VerticalPodAutoscaler) VPAVali
 		AllowCPUStartupBoost: allowCPUBoost(oldObj),
 		AllowPerVPAConfig:    allowPerVPAConfig(oldObj),
 		AllowInPlace:         allowInPlace(oldObj),
+		AllowDRARecreate:     allowDRARecreate(oldObj),
 	}
 
 	return opts
@@ -109,6 +111,22 @@ func allowInPlace(oldObj *vpa_types.VerticalPodAutoscaler) bool {
 	return false
 }
 
+func allowDRARecreate(oldObj *vpa_types.VerticalPodAutoscaler) bool {
+	if features.Enabled(features.DRARecreate) {
+		return true
+	}
+
+	if oldObj == nil {
+		return false
+	}
+
+	if oldObj.Spec.UpdatePolicy != nil && oldObj.Spec.UpdatePolicy.UpdateMode != nil && *oldObj.Spec.UpdatePolicy.UpdateMode == vpa_types.UpdateModeDRARecreate {
+		return true
+	}
+
+	return false
+}
+
 func validateVPA(vpa *vpa_types.VerticalPodAutoscaler, opts VPAValidationOptions) field.ErrorList {
 	allErrs := field.ErrorList{}
 	allErrs = append(allErrs, validateVPASpec(&vpa.Spec, field.NewPath("spec"), opts)...)
@@ -123,8 +141,30 @@ func validateVPASpec(spec *vpa_types.VerticalPodAutoscalerSpec, fldPath *field.P
 		allErrs = append(allErrs, field.Required(fldPath.Child("targetRef"), "If you're using v1beta1 version of the API, please migrate to v1"))
 	}
 
+	var draRecreateWithoutFeatureGate bool
 	if spec.UpdatePolicy != nil {
-		allErrs = append(allErrs, validateVPASpecUpdatePolicy(spec.UpdatePolicy, fldPath.Child("updatePolicy"), opts)...)
+		var policyErrs field.ErrorList
+		policyErrs, draRecreateWithoutFeatureGate = validateVPASpecUpdatePolicy(spec.UpdatePolicy, fldPath.Child("updatePolicy"), opts)
+		allErrs = append(allErrs, policyErrs...)
+
+		// Only validate DRARecreate mode requirements if feature gate is enabled
+		if spec.UpdatePolicy.UpdateMode != nil && *spec.UpdatePolicy.UpdateMode == vpa_types.UpdateModeDRARecreate && !draRecreateWithoutFeatureGate {
+			if spec.ResourcePolicy == nil || len(spec.ResourcePolicy.ResourceClaimPolicies) == 0 {
+				allErrs = append(allErrs, field.Required(fldPath.Child("resourcePolicy").Child("resourceClaimPolicies"), "resourceClaimPolicies must be set when using DRARecreate update mode"))
+			} else {
+				// Validate that at least one ResourceClaimPolicy has controlled capacities
+				hasCapacities := false
+				for _, policy := range spec.ResourcePolicy.ResourceClaimPolicies {
+					if len(policy.ControlledCapacities) > 0 {
+						hasCapacities = true
+						break
+					}
+				}
+				if !hasCapacities {
+					allErrs = append(allErrs, field.Invalid(fldPath.Child("resourcePolicy").Child("resourceClaimPolicies"), spec.ResourcePolicy.ResourceClaimPolicies, "at least one resourceClaimPolicy must have controlledCapacities when using DRARecreate update mode"))
+				}
+			}
+		}
 	}
 
 	if spec.ResourcePolicy != nil {
@@ -142,8 +182,9 @@ func validateVPASpec(spec *vpa_types.VerticalPodAutoscalerSpec, fldPath *field.P
 	return allErrs
 }
 
-func validateVPASpecUpdatePolicy(updatePolicy *vpa_types.PodUpdatePolicy, fldPath *field.Path, opts VPAValidationOptions) field.ErrorList {
+func validateVPASpecUpdatePolicy(updatePolicy *vpa_types.PodUpdatePolicy, fldPath *field.Path, opts VPAValidationOptions) (field.ErrorList, bool) {
 	allErrs := field.ErrorList{}
+	draRecreateWithoutFeatureGate := false
 
 	mode := updatePolicy.UpdateMode
 	if mode == nil {
@@ -155,6 +196,11 @@ func validateVPASpecUpdatePolicy(updatePolicy *vpa_types.PodUpdatePolicy, fldPat
 
 		if *mode == vpa_types.UpdateModeInPlace && !opts.AllowInPlace {
 			allErrs = append(allErrs, field.Forbidden(fldPath.Child("updateMode"), fmt.Sprintf("in order to use UpdateMode %s, you must enable feature gate %s in the admission-controller args", vpa_types.UpdateModeInPlace, features.InPlace)))
+		}
+
+		if *mode == vpa_types.UpdateModeDRARecreate && !opts.AllowDRARecreate {
+			allErrs = append(allErrs, field.Forbidden(fldPath.Child("updateMode"), fmt.Sprintf("in order to use UpdateMode %s, you must enable feature gate %s in the admission-controller args", vpa_types.UpdateModeDRARecreate, features.DRARecreate)))
+			draRecreateWithoutFeatureGate = true
 		}
 	}
 	if minReplicas := updatePolicy.MinReplicas; minReplicas != nil && *minReplicas <= 0 {
@@ -171,7 +217,7 @@ func validateVPASpecUpdatePolicy(updatePolicy *vpa_types.PodUpdatePolicy, fldPat
 		}
 	}
 
-	return allErrs
+	return allErrs, draRecreateWithoutFeatureGate
 }
 
 func validateVPASpecResourcePolicy(resourcePolicy *vpa_types.PodResourcePolicy, fldPath *field.Path, opts VPAValidationOptions) field.ErrorList {

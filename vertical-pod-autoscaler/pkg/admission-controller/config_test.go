@@ -58,10 +58,16 @@ func TestSelfRegistrationBase(t *testing.T) {
 	assert.Equal(t, []string{"v1"}, podRule.APIVersions, "expected API versions to match")
 	assert.Equal(t, []string{"pods"}, podRule.Resources, "expected resources to match")
 
-	vpaRule := webhook.Rules[1]
+	resourceClaimRule := webhook.Rules[1]
+	assert.Equal(t, []admissionregistration.OperationType{admissionregistration.Create}, resourceClaimRule.Operations, "expected operations to match")
+	assert.Equal(t, []string{"resource.k8s.io"}, resourceClaimRule.APIGroups, "expected API groups to match")
+	assert.Equal(t, []string{"v1"}, resourceClaimRule.APIVersions, "expected API versions to match")
+	assert.Equal(t, []string{"resourceclaims"}, resourceClaimRule.Resources, "expected resources to match")
+
+	vpaRule := webhook.Rules[2]
 	assert.Equal(t, []admissionregistration.OperationType{admissionregistration.Create, admissionregistration.Update}, vpaRule.Operations, "expected operations to match")
 	assert.Equal(t, []string{"autoscaling.k8s.io"}, vpaRule.APIGroups, "expected API groups to match")
-	assert.Equal(t, []string{"*"}, vpaRule.APIVersions, "ehook.Rulxpected API versions to match")
+	assert.Equal(t, []string{"*"}, vpaRule.APIVersions, "expected API versions to match")
 	assert.Equal(t, []string{"verticalpodautoscalers"}, vpaRule.Resources, "expected resources to match")
 
 	assert.Equal(t, admissionregistration.SideEffectClassNone, *webhook.SideEffects, "expected side effects to match")
@@ -270,10 +276,16 @@ func TestSelfRegistrationWithInvalidLabels(t *testing.T) {
 	assert.Equal(t, []string{"v1"}, podRule.APIVersions, "expected API versions to match")
 	assert.Equal(t, []string{"pods"}, podRule.Resources, "expected resources to match")
 
-	vpaRule := webhook.Rules[1]
+	resourceClaimRule := webhook.Rules[1]
+	assert.Equal(t, []admissionregistration.OperationType{admissionregistration.Create}, resourceClaimRule.Operations, "expected operations to match")
+	assert.Equal(t, []string{"resource.k8s.io"}, resourceClaimRule.APIGroups, "expected API groups to match")
+	assert.Equal(t, []string{"v1"}, resourceClaimRule.APIVersions, "expected API versions to match")
+	assert.Equal(t, []string{"resourceclaims"}, resourceClaimRule.Resources, "expected resources to match")
+
+	vpaRule := webhook.Rules[2]
 	assert.Equal(t, []admissionregistration.OperationType{admissionregistration.Create, admissionregistration.Update}, vpaRule.Operations, "expected operations to match")
 	assert.Equal(t, []string{"autoscaling.k8s.io"}, vpaRule.APIGroups, "expected API groups to match")
-	assert.Equal(t, []string{"*"}, vpaRule.APIVersions, "ehook.Rulxpected API versions to match")
+	assert.Equal(t, []string{"*"}, vpaRule.APIVersions, "expected API versions to match")
 	assert.Equal(t, []string{"verticalpodautoscalers"}, vpaRule.Resources, "expected resources to match")
 
 	assert.Equal(t, admissionregistration.SideEffectClassNone, *webhook.SideEffects, "expected side effects to match")
