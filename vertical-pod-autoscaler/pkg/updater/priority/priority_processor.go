@@ -83,8 +83,13 @@ func (p *defaultPriorityProcessor) GetUpdatePriority(pod *corev1.Pod, vpa *vpa_t
 			// ("deviceClass/capacityName") only appear in claimRequests; CPU/memory
 			// keys only appear in container requests — so a single lookup suffices.
 			requests, _ := resourcehelpers.ContainerRequestsAndLimits(podContainer.Name, pod)
-			for k, v := range claimRequests {
-				requests[k] = v
+			if len(claimRequests) > 0 {
+				if requests == nil {
+					requests = make(corev1.ResourceList, len(claimRequests))
+				}
+				for k, v := range claimRequests {
+					requests[k] = v
+				}
 			}
 
 			if request, hasRequest := requests[resourceName]; hasRequest {

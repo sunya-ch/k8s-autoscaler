@@ -355,6 +355,23 @@ func TestGetUpdatePriority_DRARecreate(t *testing.T) {
 		return pod
 	}
 
+	// makePodNoRequests creates a pod whose container has no resource requests at all
+	// (nil Requests map). This is the case that previously caused a nil-map panic when
+	// DRA claimRequests were merged into a nil corev1.ResourceList.
+	makePodNoRequests := func() *corev1.Pod {
+		pod := test.Pod().WithName("POD1").
+			AddContainer(test.Container().WithName(containerName).Get()).
+			Get()
+		pod.Namespace = namespace
+		pod.Spec.ResourceClaims = []corev1.PodResourceClaim{
+			{Name: podClaimName, ResourceClaimTemplateName: ptr.To(claimTemplate)},
+		}
+		pod.Status.ResourceClaimStatuses = []corev1.PodResourceClaimStatus{
+			{Name: podClaimName, ResourceClaimName: ptr.To(actualClaimName)},
+		}
+		return pod
+	}
+
 	makeVPA := func() *vpa_types.VerticalPodAutoscaler {
 		vpa := test.VerticalPodAutoscaler().
 			WithNamespace(namespace).
@@ -398,6 +415,7 @@ func TestGetUpdatePriority_DRARecreate(t *testing.T) {
 		claimCapacity    string // current capacity in the ResourceClaim
 		recommendedCap   string // VPA recommendation
 		wantOutside      bool
+		useNoRequests    bool // use pod with no container resource requests
 	}{
 		{
 			name:           "capacity matches recommendation — no eviction",
@@ -423,12 +441,26 @@ func TestGetUpdatePriority_DRARecreate(t *testing.T) {
 			recommendedCap: "16Gi",
 			wantOutside:    true,
 		},
+		{
+			// Regression test: container with no resource requests returns nil
+			// ResourceList from ContainerRequestsAndLimits. Writing DRA claim
+			// requests into a nil map used to panic.
+			name:           "pod container has no resource requests — no panic",
+			claimCapacity:  "16Gi",
+			recommendedCap: "32Gi",
+			wantOutside:    true,
+			useNoRequests:  true,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			p := makeProcessorWithClaim(tc.claimCapacity)
-			prio := p.GetUpdatePriority(makePod(), makeVPA(), makeRecommendation(tc.recommendedCap))
+			pod := makePod()
+			if tc.useNoRequests {
+				pod = makePodNoRequests()
+			}
+			prio := p.GetUpdatePriority(pod, makeVPA(), makeRecommendation(tc.recommendedCap))
 			assert.Equal(t, tc.wantOutside, prio.OutsideRecommendedRange, "OutsideRecommendedRange")
 		})
 	}
