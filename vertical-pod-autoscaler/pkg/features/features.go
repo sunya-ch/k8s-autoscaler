@@ -40,6 +40,15 @@ const (
 	// In each feature gate description, you must specify "components".
 	// The feature must be enabled by the --feature-gates argument on each listed component.
 
+	// alpha: v1.8.0
+	// components: admission-controller, updater
+
+	// MultidimPodAutoscaler enables the Multi-dimensional Pod Autoscaler
+	// coordination feature. When enabled, the VPA updater and admission
+	// controller respect spec.paused on VPA objects written by the MPA
+	// controller, suspending actuation without stopping the recommender.
+	MultidimPodAutoscaler featuregate.Feature = "MultidimPodAutoscaler"
+
 	// alpha: v1.7.0
 	// components: admission-controller, updater
 

@@ -114,6 +114,29 @@ type VerticalPodAutoscalerSpec struct {
 	// startupBoost specifies the startup boost policy for the pod.
 	// +optional
 	StartupBoost *StartupBoost `json:"startupBoost,omitempty"`
+
+	// Paused suspends VPA actuation (updater evictions and admission controller
+	// resource injection) without stopping the recommender. When true, the
+	// recommender continues accumulating metrics and updating recommendations,
+	// but no pods are evicted or resized.
+	//
+	// This field is intended to be managed by an external controller such as
+	// MultidimPodAutoscaler. It MUST NOT be set manually when a
+	// MultidimPodAutoscaler is managing this VPA — use the MPA object instead.
+	//
+	// Only effective when the MultidimPodAutoscaler feature gate is enabled.
+	// +optional
+	Paused *bool `json:"paused,omitempty"`
+
+	// Priority is used by MultidimPodAutoscaler to order VPAs when multiple
+	// VPAs target the same workload. Lower values have higher priority (0 is
+	// the highest priority). When two VPAs share the same priority value, the
+	// one with the earlier creation timestamp wins. When this field is nil the
+	// VPA is treated as priority 0.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	Priority *int32 `json:"priority,omitempty"`
 }
 
 // StartupBoost defines the startup boost policy.

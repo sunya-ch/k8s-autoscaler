@@ -240,6 +240,123 @@ func TestRunOnce_Status(t *testing.T) {
 	}
 }
 
+// TestRunOnce_Paused verifies that a VPA with spec.paused=true is completely
+// skipped (no evictions, no in-place updates) when the MultidimPodAutoscaler
+// feature gate is enabled, and is acted on normally when the gate is disabled.
+func TestRunOnce_Paused(t *testing.T) {
+	tests := []struct {
+		name                  string
+		paused                bool
+		featureEnabled        bool
+		expectedEvictionCount int
+	}{
+		{
+			name:                  "paused=true with feature gate enabled: no evictions",
+			paused:                true,
+			featureEnabled:        true,
+			expectedEvictionCount: 0,
+		},
+		{
+			name:                  "paused=true with feature gate disabled: evictions proceed",
+			paused:                true,
+			featureEnabled:        false,
+			expectedEvictionCount: 5,
+		},
+		{
+			name:                  "paused=false with feature gate enabled: evictions proceed",
+			paused:                false,
+			featureEnabled:        true,
+			expectedEvictionCount: 5,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.MultidimPodAutoscaler, tc.featureEnabled)
+
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			replicas := int32(5)
+			livePods := 5
+			podLabels := map[string]string{"app": "testingApp"}
+			selector := parseLabelSelector("app = testingApp")
+			containerName := "container1"
+			updateMode := vpa_types.UpdateModeAuto //nolint:staticcheck
+			rc := corev1.ReplicationController{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "ReplicationController",
+					APIVersion: "apps/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rc",
+					Namespace: "default",
+				},
+				Spec: corev1.ReplicationControllerSpec{
+					Replicas: &replicas,
+				},
+			}
+
+			vpaObj := test.VerticalPodAutoscaler().
+				WithContainer(containerName).
+				WithTarget("2", "200M").
+				WithMinAllowed(containerName, "1", "100M").
+				WithMaxAllowed(containerName, "3", "1G").
+				WithUpdateMode(updateMode).
+				WithPaused(tc.paused).
+				WithTargetRef(&autoscalingv1.CrossVersionObjectReference{
+					Kind:       rc.Kind,
+					Name:       rc.Name,
+					APIVersion: rc.APIVersion,
+				}).
+				Get()
+
+			eviction := &test.PodsEvictionRestrictionMock{}
+			inplace := &test.PodsInPlaceRestrictionMock{}
+			pods := make([]*corev1.Pod, livePods)
+			for i := range pods {
+				pods[i] = test.Pod().WithName("test_"+strconv.Itoa(i)).
+					AddContainer(test.Container().WithName(containerName).
+						WithCPURequest(resource.MustParse("1")).
+						WithMemRequest(resource.MustParse("100M")).Get()).
+					WithCreator(&rc.ObjectMeta, &rc.TypeMeta).
+					Get()
+				pods[i].Labels = podLabels
+				eviction.On("CanEvict", pods[i]).Return(true)
+				eviction.On("Evict", pods[i], nil).Return(nil)
+			}
+
+			vpaLister := &test.VerticalPodAutoscalerListerMock{}
+			vpaLister.On("List").Return([]*vpa_types.VerticalPodAutoscaler{vpaObj}, nil).Once()
+
+			podLister := &test.PodListerMock{}
+			podLister.On("List").Return(pods, nil)
+
+			mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+			// Selector is only fetched when the VPA is not skipped.
+			if tc.expectedEvictionCount > 0 {
+				mockSelectorFetcher.EXPECT().Fetch(gomock.Eq(vpaObj)).Return(selector, nil)
+			}
+
+			u := &updater{
+				vpaLister:                    vpaLister,
+				podLister:                    podLister,
+				restrictionFactory:           &restriction.FakePodsRestrictionFactory{Eviction: eviction, InPlace: inplace},
+				evictionRateLimiter:          rate.NewLimiter(rate.Inf, 0),
+				inPlaceRateLimiter:           rate.NewLimiter(rate.Inf, 0),
+				evictionAdmission:            priority.NewDefaultPodEvictionAdmission(),
+				recommendationProcessor:      &test.FakeRecommendationProcessor{},
+				selectorFetcher:              mockSelectorFetcher,
+				controllerFetcher:            controllerfetcher.FakeControllerFetcher{},
+				useAdmissionControllerStatus: true,
+				statusValidator:              newFakeValidator(true),
+				priorityProcessor:            priority.NewProcessor(),
+			}
+			u.RunOnce(context.Background())
+			eviction.AssertNumberOfCalls(t, "Evict", tc.expectedEvictionCount)
+		})
+	}
+}
+
 func testRunOnceBase(
 	t *testing.T,
 	updateMode vpa_types.UpdateMode,

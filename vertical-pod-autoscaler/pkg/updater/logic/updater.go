@@ -196,6 +196,10 @@ func (u *updater) RunOnce(ctx context.Context) {
 		// Log deprecation warnings for VPAs using deprecated modes
 		logDeprecationWarnings(vpa)
 
+		if features.Enabled(features.MultidimPodAutoscaler) && vpa.Spec.Paused != nil && *vpa.Spec.Paused {
+			klog.V(3).InfoS("Skipping VPA object because it is paused by MPA", "vpa", klog.KObj(vpa))
+			continue
+		}
 		updateMode := vpa_api_util.GetUpdateMode(vpa)
 		if updateMode != vpa_types.UpdateModeRecreate &&
 			updateMode != vpa_types.UpdateModeAuto && //nolint:staticcheck

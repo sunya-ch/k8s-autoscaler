@@ -33,6 +33,7 @@ type VerticalPodAutoscalerBuilder interface {
 	WithContainer(containerName string) VerticalPodAutoscalerBuilder
 	WithNamespace(namespace string) VerticalPodAutoscalerBuilder
 	WithUpdateMode(updateMode vpa_types.UpdateMode) VerticalPodAutoscalerBuilder
+	WithPaused(paused bool) VerticalPodAutoscalerBuilder
 	WithEvictAfterOOMSeconds(*int32) VerticalPodAutoscalerBuilder
 	WithCreationTimestamp(timestamp time.Time) VerticalPodAutoscalerBuilder
 	WithMinAllowed(containerName, cpu, memory string) VerticalPodAutoscalerBuilder
@@ -83,6 +84,7 @@ type verticalPodAutoscalerBuilder struct {
 	containerNames          []string
 	namespace               string
 	updatePolicy            *vpa_types.PodUpdatePolicy
+	paused                  *bool
 	creationTimestamp       time.Time
 	minAllowed              map[string]corev1.ResourceList
 	maxAllowed              map[string]corev1.ResourceList
@@ -300,6 +302,12 @@ func (b *verticalPodAutoscalerBuilder) WithContainerCPUStartupBoost(containerNam
 	return &c
 }
 
+func (b *verticalPodAutoscalerBuilder) WithPaused(paused bool) VerticalPodAutoscalerBuilder {
+	c := *b
+	c.paused = &paused
+	return &c
+}
+
 func (b *verticalPodAutoscalerBuilder) Get() *vpa_types.VerticalPodAutoscaler {
 	if len(b.containerNames) == 0 {
 		panic("Must call WithContainer() before Get()")
@@ -352,6 +360,7 @@ func (b *verticalPodAutoscalerBuilder) Get() *vpa_types.VerticalPodAutoscaler {
 			TargetRef:      b.targetRef,
 			Recommenders:   recommenders,
 			StartupBoost:   b.startupBoost,
+			Paused:         b.paused,
 		},
 		Status: vpa_types.VerticalPodAutoscalerStatus{
 			Recommendation: recommendation,

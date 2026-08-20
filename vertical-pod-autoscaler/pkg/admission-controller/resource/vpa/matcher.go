@@ -24,6 +24,7 @@ import (
 	"k8s.io/klog/v2"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
@@ -76,6 +77,10 @@ func (m *matcher) GetMatchingVPA(ctx context.Context, pod *corev1.Pod) *vpa_type
 			continue
 		}
 		if vpa_api_util.GetUpdateMode(vpaConfig) == vpa_types.UpdateModeOff && !vpa_api_util.HasStartupBoost(vpaConfig) {
+			continue
+		}
+		if features.Enabled(features.MultidimPodAutoscaler) && vpaConfig.Spec.Paused != nil && *vpaConfig.Spec.Paused {
+			klog.V(3).InfoS("Skipping VPA object because it is paused by MPA", "vpa", klog.KObj(vpaConfig))
 			continue
 		}
 

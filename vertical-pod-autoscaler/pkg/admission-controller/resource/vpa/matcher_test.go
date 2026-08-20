@@ -28,8 +28,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/cache"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/features"
 	controllerfetcher "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/controller_fetcher"
 	target_mock "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/target/mock"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
@@ -177,6 +179,33 @@ func TestGetMatchingVpa(t *testing.T) {
 			expectedVpaName: "auto-with-boost-vpa",
 		},
 	}
+	// pausedCases test spec.paused gating by the MultidimPodAutoscaler feature gate.
+	// They are kept separate so each sub-test can control the gate independently.
+	pausedCases := []struct {
+		name           string
+		paused         bool
+		featureEnabled bool
+		expectedFound  bool
+	}{
+		{
+			name:           "paused=true with feature gate enabled: no match",
+			paused:         true,
+			featureEnabled: true,
+			expectedFound:  false,
+		},
+		{
+			name:           "paused=true with feature gate disabled: matched",
+			paused:         true,
+			featureEnabled: false,
+			expectedFound:  true,
+		},
+		{
+			name:           "paused=false with feature gate enabled: matched",
+			paused:         false,
+			featureEnabled: true,
+			expectedFound:  true,
+		},
+	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -205,6 +234,39 @@ func TestGetMatchingVpa(t *testing.T) {
 				assert.Equal(t, tc.expectedVpaName, vpa.Name)
 			} else {
 				assert.Nil(t, vpa)
+			}
+		})
+	}
+
+	for _, tc := range pausedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, features.MutableFeatureGate, features.MultidimPodAutoscaler, tc.featureEnabled)
+
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			vpaObj := vpaBuilder.
+				WithName("paused-vpa").
+				WithUpdateMode(vpa_types.UpdateModeRecreate).
+				WithTargetRef(targetRef).
+				WithPaused(tc.paused).
+				Get()
+
+			mockSelectorFetcher := target_mock.NewMockVpaTargetSelectorFetcher(ctrl)
+			if tc.expectedFound {
+				mockSelectorFetcher.EXPECT().Fetch(gomock.Any()).AnyTimes().Return(parseLabelSelector("app = test"), nil)
+			}
+
+			vpaIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc,
+				cache.Indexers{vpa_api_util.TargetRefIndex: vpa_api_util.TargetRefIndexFunc})
+			assert.NoError(t, vpaIndexer.Add(vpaObj))
+
+			matcher := NewMatcher(vpaIndexer, mockSelectorFetcher, controllerfetcher.FakeControllerFetcher{})
+			result := matcher.GetMatchingVPA(context.Background(), podBuilder.Get())
+			if tc.expectedFound {
+				assert.NotNil(t, result)
+			} else {
+				assert.Nil(t, result)
 			}
 		})
 	}

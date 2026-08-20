@@ -556,6 +556,16 @@ func (in *VerticalPodAutoscalerSpec) DeepCopyInto(out *VerticalPodAutoscalerSpec
 		*out = new(StartupBoost)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.Paused != nil {
+		in, out := &in.Paused, &out.Paused
+		*out = new(bool)
+		**out = **in
+	}
+	if in.Priority != nil {
+		in, out := &in.Priority, &out.Priority
+		*out = new(int32)
+		**out = **in
+	}
 	return
 }
 
