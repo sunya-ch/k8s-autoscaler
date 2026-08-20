@@ -17,6 +17,10 @@ AEP - Autoscaler Enhancement Proposal
     - [Unit Tests](#unit-tests)
     - [Integration Tests](#integration-tests)
     - [End-to-end Tests](#end-to-end-tests)
+- [Risk and Mitigation](#risk-and-mitigation)
+  - [Race: spec.paused=true arrives after a pod has already been evicted](#race-specpausedtrue-arrives-after-a-pod-has-already-been-evicted)
+  - [Transient mixed-request fleet after HPA scale-out](#transient-mixed-request-fleet-after-hpa-scale-out)
+  - [Multiple MPAs targeting the same workload](#multiple-mpas-targeting-the-same-workload)
 - [Production Readiness Review Questionnaire](#production-readiness-review-questionnaire)
   - [Feature Enablement and Rollback](#feature-enablement-and-rollback)
   - [Dependencies](#dependencies)
@@ -59,12 +63,12 @@ Due to the independence of these two controllers, when they are configured to op
 The final outcome would be a large number of small pods created for the workloads.
 Manual fine-tuning the timing to do vertical/horizontal scaling and prioritization are usually needed for synchronization of the HPA and VPA.
 
-We propose a Multi-dimensional Pod Autoscaling (MPA) framework that combines the actions of vertical and horizontal autoscaling in a single action but separates the actuation completely from the controlling algorithms.
-It consists of three controllers (i.e., a recommender, an updater, and an admission controller) and an MPA API (i.e., a CRD object or CR) that connects the autoscaling recommendations to actuation.
-The multidimensional scaling algorithm is implemented in the recommender.
-The scaling decisions derived from the recommender are stored in the MPA object.
-The updater and the admission controller retrieve those decisions from the MPA object and actuate those vertical and horizontal actions.
-Our proposed MPA (with the separation of recommendations from actuation) allows developers to replace the default recommender with their alternative customized recommender, so developers can provide their own recommender implementing advanced algorithms that control both scaling actions across different resource dimensions.
+We propose a Multi-dimensional Pod Autoscaling (MPA) as a thin reactive synchronizer, fully decoupled from both HPA and VPA internals. The MPA API does not replace or wrap either controller. Instead, it considers the temporal relationship between the two scalers — HPA responds to sudden demand within seconds; VPA right-sizes over minutes to hours — and resolves their conflict without coupling MPA to either controller's internals.
+
+The MPA controller uses a newly introduced field `.spec.paused` on the VPA object to pause vertical scaling while HPA is actively scaling. This pause is gated by the `MultidimPodAutoscaler` feature gate. No other VPA internal logic changes.
+
+> [!NOTE]
+> The original AEP-5342 ([implemented in PR`#7550`](https://github.com/kubernetes/autoscaler/pull/7550)) built a monolithic Multi-dimensional Pod Autoscaler that subsumed HPA and VPA logic into a single controller. As discussed in [issue `#8493`](https://github.com/kubernetes/autoscaler/issues/8493#issuecomment-3246027731), the fundamental concern is long-term maintainability: any internal change to HPA or VPA must be tracked and replicated inside MPA, creating permanent coupling.
 
 ## Motivation
 
@@ -81,24 +85,36 @@ Therefore, there is a need to combine the two controllers so that horizontal and
 However, existing VPA/HPA designs cannot accommodate such requirements.
 Manual fine-tuning the timing or frequency to do vertical/horizontal scaling and prioritization are usually needed for synchronization of the HPA and VPA.
 
+HPA and VPA operate on fundamentally different time horizons, as observed by the KEDA community in [kedacore/keda#1788](https://github.com/kedacore/keda/issues/1788#issuecomment-1025831724):
+
+> *"VPA is meant for long-term scaling — it watches historical resource usage over time and adjusts pod sizes for efficiency. HPA is meant for sudden increases in load — it reacts to real-time metrics and scales out replicas within seconds."*
+
+This temporal difference is the root cause of their conflict:
+
+1. **During a traffic burst**, HPA detects high CPU utilization and begins scaling out replicas. At the same moment, VPA may be mid-eviction, applying a resource recommendation computed from a quiet period. This eviction *reduces* available capacity precisely when more capacity is needed, worsening latency and potentially triggering pod disruption budget violations.
+
+2. **After a scale-out**, the per-pod CPU drops because the load is now shared across more replicas. VPA observes this lower utilization and recommends smaller resource requests. HPA then sees that utilization is rising again (because the ceiling is lower) and scales out further. The result is the classic oscillation: many small pods.
+
+3. **During a scale-in**, HPA is terminating replicas. If VPA simultaneously evicts a pod for resizing, the workload can briefly drop below its minimum healthy replica count.
+
 [HPA]: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/
 [VPA]: https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler
 [not recommended]: https://cloud.google.com/kubernetes-engine/docs/concepts/horizontalpodautoscaler
 
 ### Goals
 
-- Design and implement a holistic framework with a set of controllers to achieve multi-dimensional pod autoscaling (MPA).
-- Separate the decision actuation from recommendations for both horizontal and vertical autoscaling, which enables users to replace the default recommender with their customized recommender.
-- Re-use existing HPA and VPA libraries as much as possible in MPA.
+- Design and implement a holistic framework to achieve multi-dimensional pod autoscaling (MPA).
+- Structurally prevent HPA and VPA from conflicting on the same workload.
+- Introduce a `MultidimPodAutoscaler` CRD that owns the coordination state.
+- Handle multiple autoscalers (including multiple VPAs) on the same workload.
 
 ### Non-Goals
 
-- Design of new multi-dimensional pod autoscaling algorithms. Although this proposal will enable alternate recommenders, no alternate recommenders will be created as part of this proposal.
-- Rewrite functionalities that have been implemented with existing HPA and VPA.
-- This proposal will not support running multiple recommenders for the same MPA object. Each MPA object is supposed to use only one recommender.
+- Designing a new combined scaling algorithm.
+- Replacing or extending HPA or VPA recommendation logic.
 
-## Proposal
 ### User Stories
+
 #### A New MPA Framework with Reinforcement Learning
 
 Many studies in research show that combined horizontal and vertical scaling can guarantee application performance with better resource efficiency using advanced algorithms such as reinforcement learning [1, 2]. These algorithms cannot be used with existing HPA and VPA frameworks. A new framework (MPA) is needed to combine horizontal and vertical scaling actions and separate the actuation of scaling actions from the autoscaling algorithms. The new MPA framework will work for all workloads on Kubernetes.
@@ -111,427 +127,431 @@ Many studies in research show that combined horizontal and vertical scaling can 
 
 For certain workloads, to ensure a custom metric (e.g., throughput or request-serving latency), horizontal scaling typically controls the CPU resources effectively, and vertical scaling is typically effective in increasing or decreasing the allocated memory capacity per pod. Thus, there is a need to control different types of resources at the same time using different scaling actions. Existing VPA and HPA can control these separately. However, they cannot achieve the same objective, e.g., guarantee a custom metric within an SLO target, by controlling both dimensions with different resource types independently. For example, they can lead to an awkward situation where HPA tries to spin more pods based on the higher-than-threshold CPU usage while VPA tries to squeeze the size of each pod based on the lower memory usage (after scaling out by HPA). In the end, there will be a large number of small pods created for the workloads.
 
+---
+
+## Proposal
+
+This enhancement introduces a new `MultidimPodAutoscaler` autoscaling API that coordinates multiple autoscaler objects targeting the same workload.
+
+The MPA controller auto-discovers all `VerticalPodAutoscaler` (VPA) and `HorizontalPodAutoscaler` (HPA) objects in the same namespace whose target reference matches `spec.targetRef`. It **always prioritizes HPA over VPA**: whenever any HPA is actively scaling (`currentReplicas != desiredReplicas`), all discovered VPAs are paused via `spec.paused=true`. MPA never modifies HPA.
+
+When all HPAs are stable, VPA actuation resumes after `spec.stableDurationSeconds` to allow the fleet to settle before VPA begins evicting or resizing pods. When multiple VPAs target the same workload, only one VPA holds the active token at a time; it is re-evaluated after `spec.tokenHoldDurationSeconds` to allow other VPAs a turn. These two fields are the only tuning surface exposed by the MPA spec.
+
 ## Design Details
 
-Our proposed MPA framework consists of three controllers (i.e., a recommender, an updater, and an admission controller) and an MPA API (i.e., a CRD object or CR) that connects the autoscaling recommendations to actuation. The figure below describes the architectural overview of the proposed MPA framework.
+### Architecture Overview
 
-[<img src="./kep-imgs/mpa-design.png" width="700"/>](./kep-imgs/mpa-design.png "MPA Design Overview")
+```mermaid
+flowchart TD
+    User(["User"])
 
-**MPA API.** Application owners specify the autoscaling configurations which include:
+    subgraph Cluster["Cluster"]
+        Workload["Deployment / StatefulSet"]
 
-1. whether they only want to know the recommendations from MPA or they want MPA to directly actuate the autoscaling decisions;
-2. application SLOs (e.g., in terms of latency or throughput) if there are;
-3. any custom metrics if there are; and
-4. other autoscaling configurations that exist in HPA and VPA (e.g., desired resource utilizations, container update policies, min and max number of replicas).
+        MPACR["MultidimPodAutoscaler"]
 
-MPA API is also responsible for connecting the autoscaling actions generated from the MPA Recommender to MPA Admission Controller and Updater which actually execute the scaling actions. MPA API is created based on the [multidimensional Pod scaling service] (not open-sourced) provided by Google. MPA API is a Custom Resource Definition (CRD) in Kubernetes and each MPA instance is a CR. MPA CR keeps track of recommendations on target requests and target replica numbers.
+        subgraph Scalers["Autoscalers"]
+            HPA["HorizontalPodAutoscaler"]
+            VPA1["VerticalPodAutoscaler A\n priority: 1"]
+            VPA2["VerticalPodAutoscaler B\n priority: 0"]
+        end
 
-[multidimensional Pod scaling service]: https://cloud.google.com/kubernetes-engine/docs/how-to/multidimensional-pod-autoscaling
+        MPA["MPA Controller"]
 
-**Metrics APIs.** The Metrics APIs serve both default metrics or custom metrics associated with any Kubernetes objects. Custom metrics could be the application latency, throughput, or any other application-specific metrics. HPA already consumes metrics from such [a variety of metric APIs] (e.g., `metrics.k8s.io` API for resource metrics provided by metrics-server, `custom.metrics.k8s.io` API for custom metrics provided by "adapter" API servers provided by metrics solution vendors, and the `external.metrics.k8s.io` API for external metrics provided by the custom metrics adapters as well. A popular choice for the metrics collector is Prometheus. The metrics are then used by the MPA Recommender for making autoscaling decisions.
+        HPA -- "scales replicas" --> Workload
+        VPA1 -- "evicts / resizes pods" --> Workload
+        VPA2 -- "evicts / resizes pods" --> Workload
+    end
 
-[a variety of metric APIs]: https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#support-for-metrics-apis
+    MPACR -.-> Workload
 
-**MPA Recommender.** MPA Recommender retrieves the time-indexed measurement data from the Metrics APIs and generates the vertical and horizontal scaling actions. The actions from the MPA Recommender are then updated in the MPA API object. The autoscaling behavior is based on user-defined configurations. Users can implement their own recommenders as well.
+    MPA -- "updates status" --> MPACR
+    MPA -- "pauses / resumes" --> VPA1
+    MPA -- "pauses / resumes" --> VPA2
+    MPA -. "watches" .-> MPACR
+    MPA -. "watches" .-> HPA
+    MPA -. "watches" .-> VPA1
+    MPA -. "watches" .-> VPA2
 
-**MPA Updater.** MPA Updater will update the number of replicas in the deployment and evict the eligible pods for vertical scaling.
-
-**MPA Admission-Controller.** If users intend to directly execute the autoscaling recommendations generated from the MPA Recommender, the MPA Admission-Controller will update the deployment configuration (i.e., the size of each replica) and configure the rolling update to the Application Deployment.
-
-### Action Actuation Implementation
-
-To actuate the decisions without losing availability, we plan to:
-
-1. evict pods with min-replicas configured and update Pod sizes with the web-hooked admission controller (for vertical scaling), and
-2. add or remove replicas (for horizontal scaling).
-
-We use a web-hooked admission controller to manage vertical scaling because if the actuator directly updates the vertical scaling configurations through deployment, it will potentially overload etcd (as vertical scaling might be quite frequent).
-MPA Admission Controller intercepts Pod creation requests and rewrites the request by applying recommended resources to the Pod spec.
-We do not use the web-hooked admission controller to manage the horizontal scaling as it could slow down the pod creation process.
-In the future when the [in-place vertical resizing](https://github.com/kubernetes/enhancements/issues/1287) is enabled, we can enable the option of in-place vertical resizing while keeping the web-hooked admission controller for eviction-based vertical resizing as an option as well.
-
-[<img src="./kep-imgs/mpa-action-actuation.png" width="400"/>](./kep-imgs/mpa-action-actuation.png "MPA Action Actuation")
-
-Pros:
-- Vertical scaling is handled by webhooks to avoid overloading etcd
-- Horizontal scaling is handled through deployment to avoid extra overhead by webhooks
-- Authentication and authorization for vertical scaling are handled by admission webhooks
-- Recommendation and the actuation are completely separated
-
-Cons:
-- Webhooks introduce extra overhead for vertical scaling operations (can be avoided after in-place resizing of pod is enabled without eviction)
-- Vertical and horizontal scaling executions are separated (can be avoided after in-place resizing of pod is enabled without eviction)
-- State changes in pod sizes are not persisted (too much to keep in etcd, could use Prometheus to store pod state changes)
-
-### Action Recommendation Implementation
-
-To generate the vertical scaling action recommendation, we reuse VPA libraries as much as possible to implement scaling algorithm integrated with the newly generated MPA API code.
-To do that, we need to update accordingly the code which read and update the VPA objects to be interacting with the MPA objects.
-To generate the horizontal scaling action recommendation, we reuse HPA libraries, integrating with the MPA API code, to reads and updates the MPA objects.
-We integrate vertical and horizontal scaling in a single feedback cycle.
-As an intitial solution, vertical scaling and horizontal scaling is performed alternatively (vertical scaling first).
-Vertical scaling will scale the CPU and memory allocations based on the historical usage; and horizontal scaling will scale the number of replicas based on either CPU utilization or a custom metric.
-In the future, we can consider more complex way of prioritization and conflict resolution.
-The separation of recommendation and actuation allows customized recommender to be used to replace the default recommender.
-For example, users can plug-in their RL-based controller to replace the MPA recommender, receiving measurements from the Metrics Server and modifying the MPA objects directly to give recommendations.
-
-The implementation of the MPA framework (the backend) is based on the existing HPA and VPA codebase so that it only requires minimum code maintenance.
-Reused Codebase References:
-- HPA: https://github.com/kubernetes/kubernetes/tree/master/pkg/controller/podautoscaler
-- VPA: https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler
-
-### MPA API Object
-
-We reuse the CR definitions from the [MultidimPodAutoscaler](https://cloud.google.com/kubernetes-engine/docs/how-to/multidimensional-pod-autoscaling) object developed by Google.
-`MultidimPodAutoscaler` is the configuration for multi-dimensional Pod autoscaling, which automatically manages Pod resources and their count based on historical and real-time resource utilization.
-MultidimPodAutoscaler has two main fields: `spec` and `status`.
-
-#### MPA Object
-
+    User -- "creates" --> MPACR
 ```
-apiVersion: autoscaling.gke.io/v1beta1
-kind: MultidimPodAutoscaler
-metadata:
-  name: my-autoscaler
-# MultidimPodAutoscalerSpec
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: my-target
-  policy:
-    updateMode: Auto
-  goals:
-    metrics:
-    - type: Resource
-      resource:
-      # Define the target CPU utilization request here
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: target-cpu-util
-  constraints:
-    global:
-      minReplicas: min-num-replicas
-      maxReplicas: max-num-replicas
-    containerControlledResources: [ memory, cpu ]  # Added cpu here as well
-    container:
-    - name: '*' # either a literal name, or "*" to match all containers
-                # this is not a general wildcard match
-    # Define boundaries for the memory request here
-      requests:
-        minAllowed:
-          memory: min-allowed-memory
-        maxAllowed:
-          memory: max-allowed-memory
-  # Define the recommender to use here
-  recommenders:
-  - name: my-recommender
 
-# MultidimPodAutoscalerStatus
-status:
-  lastScaleTime: timestamp
-  currentReplicas: number-of-replicas
-  desiredReplicas: number-of-recommended-replicas
-  recommendation:
-    containerRecommendations:
-    - containerName: name
-      lowerBound: lower-bound
-      target: target-value
-      upperBound: upper-bound
-  conditions:
-  - lastTransitionTime: timestamp
-    message: message
-    reason: reason
-    status: status
-    type: condition-type
-  currentMetrics:
-  - type: metric-type
-    value: metric-value
+MPA is decoupled from both controllers:
+
+- All coordination state (active autoscaler, last transition time, discovered scalers) lives in the `MultidimPodAutoscaler` CR status.
+- It **watches** HPA status (`currentReplicas`, `desiredReplicas`) to determine whether any HPA is in-progress.
+- It **watches** VPA for prority and condition status to determine readiness and priority of each VPA.
+- It **pause or resume** VPA via its `spec.paused`.
+
+#### MultidimPodAutoscaler API
+
+```go
+// MultidimPodAutoscaler coordinates all HPAs and VPAs that target the same
+// workload. The user declares intent via spec.targetRef; the controller
+// discovers the actual scalers and records them in status.
+type MultidimPodAutoscaler struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+
+    Spec   MultidimPodAutoscalerSpec   `json:"spec"`
+    Status MultidimPodAutoscalerStatus `json:"status,omitempty"`
+}
+
+type MultidimPodAutoscalerSpec struct {
+    // TargetRef points to the workload being scaled.
+    // The controller uses this to discover all HPAs and VPAs in the same
+    // namespace whose scaleTargetRef / targetRef matches this reference.
+    TargetRef autoscalingv1.CrossVersionObjectReference `json:"targetRef"`
+
+    // StableDurationSeconds is the minimum number of seconds all HPAs must
+    // have been stable (currentReplicas == desiredReplicas) before the
+    // controller allows a VPA to become active. This prevents VPA from
+    // resuming evictions while the fleet is still settling after a scale event.
+    // Defaults to 60.
+    // +optional
+    StableDurationSeconds *int32 `json:"stableDurationSeconds,omitempty"`
+
+    // TokenHoldDurationSeconds is the maximum number of seconds a single VPA
+    // may remain the active autoscaler before the controller re-evaluates
+    // which VPA should hold the token. This prevents a high-priority VPA from
+    // monopolising actuation indefinitely when multiple VPAs target the same
+    // workload. After the token expires the controller re-selects the
+    // highest-priority VPA; if the winner is unchanged the token is simply
+    // renewed. Defaults to 600.
+    // +optional
+    TokenHoldDurationSeconds *int32 `json:"tokenHoldDurationSeconds,omitempty"`
+}
+
+type MultidimPodAutoscalerStatus struct {
+    // ActiveAutoscaler is the name and type of the scaler currently allowed
+    // to act. Nil when no scaler is active (e.g., between an HPA stabilizing
+    // and VPA resuming after stableDurationSeconds).
+    // +optional
+    ActiveAutoscaler *AutoScalerRef `json:"activeAutoscaler,omitempty"`
+
+    // LastTransitionTime is the last time the active autoscaler changed.
+    // +optional
+    LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+
+    // AutoScalers lists the HorizontalPodAutoscalers and VerticalPodAutoscalers
+    // discovered by the controller as co-targeting the same workload as this
+    // MPA. Updated on every reconcile.
+    // +optional
+    // +listType=map
+    // +listMapKey=name
+    AutoScalers []AutoScalerRef `json:"autoscalers,omitempty"`
+
+    // Conditions describes the current state of the MultidimPodAutoscaler.
+    // +optional
+    // +patchMergeKey=type
+    // +patchStrategy=merge
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ScalerType identifies the kind of autoscaler referenced by an AutoScalerRef.
+// +enum
+type ScalerType string
+
+const (
+    // HorizontalPodAutoscalerScalerType indicates the referenced scaler is a
+    // HorizontalPodAutoscaler.
+    HorizontalPodAutoscalerScalerType ScalerType = "HorizontalPodAutoscaler"
+
+    // VerticalPodAutoscalerScalerType indicates the referenced scaler is a
+    // VerticalPodAutoscaler.
+    VerticalPodAutoscalerScalerType ScalerType = "VerticalPodAutoscaler"
+)
+
+// AutoScalerRef identifies a single HPA or VPA object tracked by the MPA.
+type AutoScalerRef struct {
+    // Name is the name of the HPA or VPA object.
+    Name string `json:"name"`
+
+    // ScalerType is the kind of the referenced scaler.
+    // +kubebuilder:validation:Enum=HorizontalPodAutoscaler;VerticalPodAutoscaler
+    ScalerType ScalerType `json:"scalerType"`
+
+    // InProgress indicates whether this scaler is currently active.
+    // For HPA: true when desiredReplicas != currentReplicas.
+    // For VPA: true when a recommendation has been provided (RecommendationProvided condition).
+    InProgress bool `json:"inProgress"`
+}
 ```
+
+### API Changes
+
+#### VPA API: `spec.paused` field
+
+A single boolean field `Paused` added to `VerticalPodAutoscalerSpec`:
+
+```go
+// Paused suspends VPA actuation without stopping the recommender.
+// Managed by MultidimPodAutoscaler when the MultidimPodAutoscaler
+// feature gate is enabled. Do not set manually when an MPA is present.
+// +optional
+Paused bool `json:"paused,omitempty"`
+```
+
+### MPA Controller Loop
+
+1. **MPA create event.** The controller lists all HPAs and VPAs in `mpa.Namespace` whose `scaleTargetRef` / `targetRef` matches `spec.targetRef`. It writes the discovered names into `status.autoscalers` and registers the new MPA with the HPA/VPA watcher. If no scalers are found, the controller updates status and returns — nothing to coordinate.
+
+    This design reflects the real ownership boundary:
+    - The user declares *intent* — "coordinate autoscalers for this workload" — via `spec.targetRef`.
+    - The controller observes *which scalers exist* and records them in status.
+    - See [issue #10158](https://github.com/kubernetes/autoscaler/issues/10158) for the multi-VPA motivation.
+
+2. **HPA/VPA watch events.** The HPA/VPA watcher observes Create, Update, and Delete events on all HPA and VPA objects whose `scaleTargetRef` matches a registered MPA. A newly discovered scaler is added to `status.autoscalers`. A deleted or unbound scaler is removed. Status is updated to reflect the current observed state on each event.
+
+3. **Active autoscaler decision.** On each reconcile, the controller evaluates `status.activeAutoscaler`:
+
+    - If `status.activeAutoscaler` is nil:
+      - If any HPA is scaling (`hpa.status.currentReplicas != hpa.status.desiredReplicas`), set that HPA as the active autoscaler.
+      - If `spec.stableDurationSeconds` has elapsed since `status.lastTransitionTime`, select the highest-priority VPA (lowest `priority` number; tie-break: earliest `lastTransitionTime`) as the active autoscaler and unpause it.
+      - Otherwise, do nothing (fleet is in the post-HPA settling window).
+    - If `status.activeAutoscaler` is an HPA:
+      - If that HPA has become stable (`currentReplicas == desiredReplicas`), reset `activeAutoscaler` to nil and record `status.lastTransitionTime` to start the `stableDurationSeconds` timer.
+      - Otherwise, do nothing.
+    - If `status.activeAutoscaler` is a VPA:
+      - If `spec.tokenHoldDurationSeconds` has not yet elapsed since `status.lastTransitionTime`, do nothing (current VPA retains the token).
+      - Otherwise, re-select the highest-priority VPA; if the winner differs from the current holder, update `activeAutoscaler` and record `status.lastTransitionTime`.
+
+    Update `status.lastTransitionTime` whenever `status.activeAutoscaler` changes.
+
+4. **Pause enforcement.** All VPAs that are not the active autoscaler are paused by setting `.spec.paused=true`. When the active autoscaler is an HPA or nil-with-delay, all VPAs are paused.
+
+### VPA `spec.paused` Field
+
+A new boolean field `Paused` is added to `VerticalPodAutoscalerSpec` (top-level). There is no equivalent `spec.paused` in the Kubernetes HPA API — this field is introduced specifically for MPA coordination and has no direct counterpart in the HPA type.
+
+```go
+// VerticalPodAutoscalerSpec is the specification of the behavior of the autoscaler.
+type VerticalPodAutoscalerSpec struct {
+    TargetRef    *autoscalingv1.CrossVersionObjectReference `json:"targetRef"`
+    UpdatePolicy *PodUpdatePolicy                          `json:"updatePolicy,omitempty"`
+    ResourcePolicy *PodResourcePolicy                      `json:"resourcePolicy,omitempty"`
+    Recommenders []*VerticalPodAutoscalerRecommenderSelector `json:"recommenders,omitempty"`
+    StartupBoost *StartupBoost                             `json:"startupBoost,omitempty"`
+
+    // Paused suspends VPA actuation (updater evictions and admission controller
+    // resource injection) without stopping the recommender. When true, the
+    // recommender continues accumulating metrics and updating recommendations,
+    // but no pods are evicted or resized.
+    //
+    // This field is intended to be managed by an external controller such as
+    // MultidimPodAutoscaler. It MUST NOT be set manually when a
+    // MultidimPodAutoscaler is managing this VPA — use the MPA object instead.
+    //
+    // Only effective when the MultidimPodAutoscaler feature gate is enabled.
+    // +optional
+    Paused bool `json:"paused,omitempty"`
+}
+```
+
+**How VPA components respect `spec.paused`** (gated by `features.Enabled(features.MultidimPodAutoscaler)`):
+
+- **Updater** ([`updater.go:199`](pkg/updater/logic/updater.go)): adds a `spec.paused` check immediately after the existing `updateMode` filter. A paused VPA is skipped for the entire loop iteration — no evictions, no in-place resizes.
+
+  ```go
+  // After existing updateMode filter:
+  if features.Enabled(features.MultidimPodAutoscaler) && vpa.Spec.Paused {
+      klog.V(3).InfoS("Skipping VPA object because it is paused by MPA", "vpa", klog.KObj(vpa))
+      continue
+  }
+  ```
+
+- **Admission controller** ([`matcher.go:78`](pkg/admission-controller/resource/vpa/matcher.go)): adds a `spec.paused` check alongside the existing `UpdateModeOff` skip.
+
+  ```go
+  if features.Enabled(features.MultidimPodAutoscaler) && vpaConfig.Spec.Paused {
+      continue
+  }
+  ```
+
+- **Recommender**: no change. The recommender does not check `spec.paused`. It continues building the historical model regardless of pause state, ensuring the VPA has a fresh recommendation ready the moment actuation resumes.
+
+- On deletion of the `MultidimPodAutoscaler`, a finalizer ensures `spec.paused` is set back to `false` before the MPA object is garbage-collected.
+
+> **Extended resource coverage** — because `spec.paused` gates the VPA updater and admission controller at their entry points, the pause applies uniformly to *all* resource dimensions the VPA manages: CPU, memory, and extended resources backed by Dynamic Resource Allocation. In the [`UpdateModeDRARecreate` mode](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate) (WIP), VPA patches `ResourceClaim` capacity at pod-creation time via the admission controller. When `spec.paused=true`, that ResourceClaim patch is also suppressed.
+
+## Risk and Mitigation
+
+### Race: `spec.paused=true` arrives after a pod has already been evicted
+
+There is a window between the VPA updater deciding to evict a pod and the `paused=true` patch being reflected in the updater's in-memory snapshot. If the patch lands while the updater is mid-loop and a pod has already been selected for eviction, that eviction will complete. If the admission controller cache is also stale at the moment the replacement pod is admitted, the VPA recommendation will be applied to the new pod — both outcomes are safe.
+
+For in-place mode (`UpdateModeInPlace` or `UpdateModeInPlaceOrRecreate`), no pod is deleted; the resize is applied by patching the pod's `/resize` subresource and negotiated by the kubelet. A pause arriving mid-resize leaves the pod running at the VPA-recommended values, which is acceptable.
+
+**Mitigation:** HPA does not report `desiredReplicas != currentReplicas` instantaneously — there is typically a 15–30 second stabilization window before HPA issues a scale. The MPA synchronizer patches `spec.paused=true` before HPA begins creating new pods, giving the VPA updater's current loop time to complete. Keeping vertical steps small further limits transient resource divergence across pods. To monitor the state, check `VPA.status.conditions` (eviction) and `pod.status.resize` (in-place resize) on pods whose VPA has `spec.paused=true`.
+
+### Transient mixed-request fleet after HPA scale-out
+
+When VPA has right-sized some pods and HPA then scales out, new pods start at the pod template's original resource requests because `spec.paused=true` prevents the admission controller from applying the VPA recommendation. This creates a fleet with heterogeneous resource requests, which can skew the HPA utilization denominator and trigger a spurious extra scale step.
+
+**Why this is bounded and acceptable:**
+
+1. **Window is short.** Once HPA stabilizes, MPA resumes VPA after `stableDurationSeconds`. VPA then evicts the over-provisioned pods one by one (subject to PDB), resolving the mixed state within one eviction cycle (~minutes). HPA's built-in stabilization (scale-up cooldown, ±10% tolerance band) suppresses most spurious decisions during this window.
+
+2. **Over-provisioning is the correct bias during a burst.** Larger resource requests make `currentUtilization` appear lower, biasing HPA toward scale-out rather than scale-in — which is the right behavior under load.
+
+3. **The alternative is worse.** Leaving `spec.paused=false` so the admission controller patches new pods during an HPA scale-out re-introduces the concurrent VPA-eviction / HPA-scaling conflict that MPA exists to prevent.
+
+**Mitigation:** watch `kube_pod_container_resource_requests` grouped by workload — a non-zero spread between `min` and `max` requests indicates the fleet is mixed.
+
+### Multiple MPAs targeting the same workload
+
+Nothing in the API prevents a user from creating two or more `MultidimPodAutoscaler` objects in the same namespace with identical `spec.targetRef` values. Each MPA controller instance runs an independent reconcile loop and has no awareness of sibling MPA objects. If two MPA objects co-target the same workload, they will race to pause and unpause the same VPAs on every reconcile cycle.
+
+**Why this is a problem:**
+
+- Each MPA evaluates its own `status.activeAutoscaler` and `status.lastTransitionTime` independently. One MPA may decide a VPA should be active (unpaused), while the other simultaneously decides it should be paused. The last writer wins on each API server round-trip, producing non-deterministic VPA pause state.
+- `spec.paused` is owned by whichever MPA most recently completed its patch. Server-Side Apply field ownership is per-manager, so both managers can own the same field and overwrite each other without conflict detection.
+- The `tokenHoldDuration` token-rotation logic is meaningless under two competing state machines: neither MPA's timer reflects actual unpaused time for the VPA.
+
+**Mitigation — detection:**
+
+The MPA controller checks on each reconcile whether any other `MultidimPodAutoscaler` object in the same namespace shares its `spec.targetRef`. If a conflict is detected:
+
+1. The controller sets a `Degraded=True` status condition on the object with reason `ConflictingMPA` and a message listing the conflicting object names.
+2. No pause/unpause patches are issued while the condition is set — the controller backs off entirely to avoid making the race worse.
+3. The conflict is logged at warning level and surfaced via the `mpa_conflicting_target_total` Prometheus counter (labels: `namespace`, `target_kind`, `target_name`).
+
+The condition clears automatically once the conflict is resolved (the other MPA is deleted or its `spec.targetRef` is changed).
+
+**Mitigation — prevention:**
+
+A validating admission webhook (part of the MPA admission controller) rejects `CREATE` and `UPDATE` operations on `MultidimPodAutoscaler` objects when another MPA in the same namespace already references the same `spec.targetRef`. The webhook returns a descriptive error message identifying the conflicting object, so operators can resolve the issue before the object is persisted. This makes the conflict a hard error at admission time rather than a silent runtime misbehaviour.
+
+> **Operator guidance:** use one `MultidimPodAutoscaler` per workload. If different teams need to observe or tune the same workload's autoscaling, they should coordinate through a shared MPA object rather than creating independent ones.
 
 ### Test Plan
 
-<!--
-**Note:** *Not required until targeted at a release.*
-The goal is to ensure that we don't accept enhancements with inadequate testing.
-
-All code is expected to have adequate tests (eventually with coverage
-expectations). Please adhere to the [Kubernetes testing guidelines][testing-guidelines]
-when drafting this test plan.
-
-[testing-guidelines]: https://git.k8s.io/community/contributors/devel/sig-testing/testing.md
--->
-
-[ ] I/we understand the owners of the involved components may require updates to
-existing tests to make this code solid enough prior to committing the changes necessary
-to implement this enhancement.
+[ ] I/we understand the owners of the involved components may require updates to existing tests to make this code solid enough prior to committing the changes necessary to implement this enhancement.
 
 #### Unit Tests
 
-<!--
-In principle every added code should have complete unit test coverage, so providing
-the exact set of tests will not bring additional value.
-However, if complete unit test coverage is not possible, explain the reason of it
-together with explanation why this is acceptable.
--->
-
-<!--
-Additionally, for Alpha try to enumerate the core package you will be touching
-to implement this enhancement and provide the current unit coverage for those
-in the form of:
-- <package>: <date> - <current test coverage>
-The data can be easily read from:
-https://testgrid.k8s.io/sig-testing-canaries#ci-kubernetes-coverage-unit
-
-This can inform certain test coverage improvements that we want to do before
-extending the production code to implement this enhancement.
--->
-
-<!-- - `<package>`: `<date>` - `<test coverage>` -->
-
-Unit tests are located at each controller package.
+- VPA updater and admission controller skip a paused VPA when the feature gate is enabled; neither skips it when the gate is disabled.
+- MPA pauses all VPAs when any HPA is scaling (`currentReplicas != desiredReplicas`), unpauses after `stableDurationSeconds`, and issues no patch when the state is already correct (idempotency).
+- `tokenHoldDurationSeconds` triggers VPA token re-evaluation; token is renewed without patching `spec.paused` when the winner is unchanged.
+- MPA deletion clears `spec.paused` on all managed VPAs via finalizer.
+- `desiredReplicas=0` (HPA not yet evaluated) and missing HPA/VPA refs do not crash the controller and do not modify unrelated VPA objects.
 
 #### Integration Tests
 
-<!--
-This question should be filled when targeting a release.
-For Alpha, describe what tests will be added to ensure proper quality of the enhancement.
-
-For Beta and GA, add links to added tests together with links to k8s-triage for those tests:
-https://storage.googleapis.com/k8s-triage/index.html
--->
-
-<!-- - <test>: <link to test coverage> -->
-
-Integration tests are to be added in the beta version.
+- Create a `MultidimPodAutoscaler`; set HPA `desiredReplicas > currentReplicas`; verify `vpa.spec.paused=true` is set within one reconcile interval.
+- Simulate HPA convergence; verify `vpa.spec.paused` is cleared after `stableDurationSeconds`.
+- With two VPAs, verify token rotates to the second VPA after `tokenHoldDurationSeconds` elapses.
+- Delete the `MultidimPodAutoscaler`; verify `vpa.spec.paused` is cleared and finalizer is removed.
+- Verify no patch is issued when `vpa.spec.paused` is already in the correct state (no spurious writes).
+- Verify `vpa.spec.updatePolicy.updateMode` is never modified by MPA under any scenario.
+- Create two `MultidimPodAutoscaler` objects with the same `spec.targetRef`; verify the admission webhook rejects the second object. Bypass the webhook and verify both objects enter `Degraded=True / ConflictingMPA` and that no `vpa.spec.paused` patches are issued while the conflict persists. Delete one MPA and verify the remaining MPA clears its `Degraded` condition and resumes normal operation.
 
 #### End-to-End Tests
 
-<!--
-This question should be filled when targeting a release.
-For Alpha, describe what tests will be added to ensure proper quality of the enhancement.
-
-For Beta and GA, add links to added tests together with links to k8s-triage for those tests:
-https://storage.googleapis.com/k8s-triage/index.html
-
-We expect no non-infra related flakes in the last month as a GA graduation criteria.
--->
-
-<!-- - <test>: <link to test coverage> -->
-
-End-to-end tests are to be added in the beta version.
-
-## Production Readiness Review Questionnaire
-
-<!--
-Production readiness reviews are intended to ensure that features merging into
-Kubernetes are observable, scalable and supportable; can be safely operated in
-production environments, and can be disabled or rolled back in the event they
-cause increased failures in production. See more in the PRR KEP at
-https://git.k8s.io/enhancements/keps/sig-architecture/1194-prod-readiness.
-
-The production readiness review questionnaire must be completed and approved
-for the KEP to move to `implementable` status and be included in the release.
-
-In some cases, the questions below should also have answers in `kep.yaml`. This
-is to enable automation to verify the presence of the review, and to reduce review
-burden and latency.
-
-The KEP must have a approver from the
-[`prod-readiness-approvers`](http://git.k8s.io/enhancements/OWNERS_ALIASES)
-team. Please reach out on the
-[#prod-readiness](https://kubernetes.slack.com/archives/CPNHUMN74) channel if
-you need any help or guidance.
--->
+- Deploy a workload with HPA (CPU) and VPA (CPU + memory). Without `MultidimPodAutoscaler`, trigger a scale-out and observe VPA evictions disrupting it. With `MultidimPodAutoscaler`, repeat the same scale-out and confirm VPA does not evict any pods during the event.
+- Confirm `MultidimPodAutoscaler` status conditions reflect cluster state accurately across both phases.
+- Confirm deletion of `MultidimPodAutoscaler` leaves both HPA and VPA fully operational (VPA resumes actuation).
 
 ### Feature Enablement and Rollback
 
-<!--
-This section must be completed when targeting alpha to a release.
--->
+- **Enabled:** the MPA Controller controller starts, watches `MultidimPodAutoscaler` objects, and manages `vpa.spec.paused`. The VPA updater and admission controller begin checking `spec.paused`.
+- **Disabled after being enabled:** the MPA Controller stops. Any VPA with `spec.paused=true` set by MPA retains that value. The VPA updater and admission controller **ignore** the field (gate is off) and resume actuation automatically — no manual cleanup required. However, the field remains set in the object until the MPA finalizer runs or the operator clears it.
 
-#### How can this feature be enabled / disabled in a live cluster?
+Rollback is safe: `spec.paused` is idempotent. Setting it to `false` (or ignoring it when gate is off) has no side effects on running pods.
 
-MPA can be enabled by checking the prerequisite and executing `./deploy/mpa-up.sh`.
+### Graduation Criteria
 
-#### Does enabling the feature change any default behavior?
+**Alpha:**
+- `MultidimPodAutoscaler` CRD available under the `MultidimPodAutoscaler` feature gate.
+- `vpa.spec.paused` field added; VPA updater and admission controller check it under the feature gate.
+- Reactive synchronizer loop implemented and unit-tested.
+- Finalizer cleanup on MPA deletion implemented.
+- Integration tests pass.
 
-No.
+**Beta:**
+- E2E tests demonstrate that VPA evictions do not occur during HPA scale-outs.
+- `stableDurationSeconds` and `tokenHoldDurationSeconds` validated with production workloads.
+- Leader election for the synchronizer controller.
+- Prometheus metrics: `mpa_phase_transitions_total`, `mpa_vpa_paused_seconds`.
 
-#### Can the feature be disabled once it has been enabled (i.e. can we roll back the enablement)?
+**GA:**
+- No open P1/P2 bugs for 2+ releases.
+- E2E tests are flake-free.
+- Documentation published on kubernetes.io.
 
-MPA can be disabled by executing `./deploy/mpa-down.sh`.
+### Version Skew
 
-#### What happens if we reenable the feature if it was previously rolled back?
+The MPA Controller controller is a standalone binary. It only writes `vpa.spec.paused` on `VerticalPodAutoscaler` objects and reads `autoscaling/v2` HPA status. It does not interact with the VPA recommender, updater, or admission controller directly. Version skew between VPA components has no effect on the synchronizer — the `spec.paused` field is part of the persisted API object.
 
-No impact will happen because everytime MPA is enabled it is a full new reset and restart of MPA.
+### Kubernetes Version Compatibility
 
-#### Are there any tests for feature enablement/disablement?
+No minimum Kubernetes version beyond what VPA already requires. The synchronizer reads only `autoscaling/v2` HPA status fields (`currentReplicas`, `desiredReplicas`), which have been stable since Kubernetes 1.23.
 
-End-to-end test of MPA will be included in the beta version.
+---
 
-### Dependencies
+## Implementation History
 
-<!--
-This section must be completed when targeting beta to a release.
--->
+- 2024-08-20: initial reproposal — decoupled synchronizer model with configurable alternating priority
+- 2025-07-XX: revised to HPA-priority reactive model; removed configurable priority and initial phase; replaced `updateMode=Off` mechanism with new `vpa.spec.paused` field; introduced `stableDurationSeconds` (post-HPA settling delay before VPA resumes) and `tokenHoldDurationSeconds` (maximum time a single VPA holds the active token before re-evaluation); confirmed full decoupling — MPA never reads VPA internals, only writes one field; noted that coordination guarantee extends to DRA extended resources via `UpdateModeDRARecreate` ([NNNN-dra-recreate](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate))
 
-#### Does this feature depend on any specific services running in the cluster?
-
-MPA relies on cluster-level `metrics.k8s.io` API (for example, from [metrics-server](https://github.com/kubernetes-sigs/metrics-server))
-For the evict-and-replace mechanism, the API server needs to support the MutatingAdmissionWebhook API.
-
-### Scalability
-
-<!--
-For alpha, this section is encouraged: reviewers should consider these questions
-and attempt to answer them.
-
-For beta, this section is required: reviewers must answer these questions.
-
-For GA, this section is required: approvers should be able to confirm the
-previous answers based on experience in the field.
--->
-
-#### Will enabling / using this feature result in any new API calls?
-No, replacing HPA/VPA with MPA only translates the way how recommendations are generated (separation of recommendation from actuation).
-The original API calls used by HPA/VPA are reused by MPA and no new API calls are used by MPA.
-
-#### Will enabling / using this feature result in introducing new API types?
-Yes, MPA introduces a new Custom Resource `MultidimPodAutoscaler`, similar to `VerticalPodAutoscaler`.
-
-#### Will enabling / using this feature result in any new calls to the cloud provider?
-No.
-
-#### Will enabling / using this feature result in increasing size or count of the existing API objects?
-No. It will not affect any existing API objects.
-
-#### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
-No. To the best of our knowledge, it will not cause any increasing time of [existing SLIs/SLOs](https://github.com/kubernetes/community/blob/master/sig-scalability/slos/slos.md).
-
-#### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
-No.
-
-#### Can enabling / using this feature result in resource exhaustion of some node resources (PIDs, sockets, inodes, etc.)?
-No.
-
-<!--
-Describe them, providing:
-  - API call type (e.g. PATCH pods)
-  - estimated throughput
-  - originating component(s) (e.g. Kubelet, Feature-X-controller)
-Focusing mostly on:
-  - components listing and/or watching resources they didn't before
-  - API calls that may be triggered by changes of some Kubernetes resources
-    (e.g. update of object X triggers new updates of object Y)
-  - periodic API calls to reconcile state (e.g. periodic fetching state,
-    heartbeats, leader election, etc.)
--->
-
-#### Will enabling / using this feature result in introducing new API types?
-
-<!--
-Describe them, providing:
-  - API type
-  - Supported number of objects per cluster
-  - Supported number of objects per namespace (for namespace-scoped objects)
--->
-
-#### Will enabling / using this feature result in any new calls to the cloud provider?
-
-<!--
-Describe them, providing:
-  - Which API(s):
-  - Estimated increase:
--->
-
-#### Will enabling / using this feature result in increasing size or count of the existing API objects?
-
-<!--
-Describe them, providing:
-  - API type(s):
-  - Estimated increase in size: (e.g., new annotation of size 32B)
-  - Estimated amount of new objects: (e.g., new Object X for every existing Pod)
--->
-
-#### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
-
-<!--
-Look at the [existing SLIs/SLOs].
-
-Think about adding additional work or introducing new steps in between
-(e.g. need to do X to start a container), etc. Please describe the details.
-
-[existing SLIs/SLOs]: https://git.k8s.io/community/sig-scalability/slos/slos.md#kubernetes-slisslos
--->
-
-#### Will enabling / using this feature result in non-negligible increase of resource usage (CPU, RAM, disk, IO, ...) in any components?
-
-<!--
-Things to keep in mind include: additional in-memory state, additional
-non-trivial computations, excessive access to disks (including increased log
-volume), significant amount of data sent and/or received over network, etc.
-This through this both in small and large cases, again with respect to the
-[supported limits].
-
-[supported limits]: https://git.k8s.io/community//sig-scalability/configs-and-limits/thresholds.md
--->
-
-### Troubleshooting
-
-<!--
-This section must be completed when targeting beta to a release.
-
-For GA, this section is required: approvers should be able to confirm the
-previous answers based on experience in the field.
-
-The Troubleshooting section currently serves the `Playbook` role. We may consider
-splitting it into a dedicated `Playbook` document (potentially with some monitoring
-details). For now, we leave it here.
--->
-
-#### How does this feature react if the API server and/or etcd is unavailable?
-
-#### What are other known failure modes?
-
-<!--
-For each of them, fill in the following information by copying the below template:
-  - [Failure mode brief description]
-    - Detection: How can it be detected via metrics? Stated another way:
-      how can an operator troubleshoot without logging into a master or worker node?
-    - Mitigations: What can be done to stop the bleeding, especially for already
-      running user workloads?
-    - Diagnostics: What are the useful log messages and their required logging
-      levels that could help debug the issue?
-      Not required until feature graduated to beta.
-    - Testing: Are there any tests for failure mode? If not, describe why.
--->
-
-#### What steps should be taken if SLOs are not being met to determine the problem?
+---
 
 ## Alternatives
 
-<!--
-What other approaches did you consider, and why did you rule them out? These do
-not need to be as detailed as the proposal, but should include enough
-information to express the idea and why it was not acceptable.
--->
+### Original AEP-5342 (PR #7550): Monolithic MPA Controller
 
-### MPA as a Recommender Only
+[PR #7550](https://github.com/kubernetes/autoscaler/pull/7550) implemented the original AEP-5342 as a full new controller internalizing HPA and VPA logic. The primary concern raised in [issue #8493](https://github.com/kubernetes/autoscaler/issues/8493#issuecomment-3246027731) is long-term maintainability: any change to upstream HPA or VPA must be tracked and replicated inside MPA, creating permanent coupling. It also forces operators to migrate their existing HPA/VPA objects to `MultidimPodAutoscaler` objects. The reactive synchronizer avoids both problems.
 
-An alternative option is to have MPA just as a recommender.
-For VPA, based on the support of the customized recommender, MPA can be implemented as a recommender to write to a VPA object. Then VPA updater and admission controller will actuate the recommendation.
-For HPA, additional support for alternative recommenders is needed so MPA can write scaling recommendations to the HPA object as well.
+### Google GKE Approach: MPA Translated to HPA+VPA Objects
 
-- Pros:
-  - Less work and easier maintenance in the future
-  - Simple especially when vertical and horizontal are two completely independent control loops
-- Cons:
-  - Additional support from HPA (enabling customized recommenders) is needed which requires update in the upstream Kubernetes
-  - Hard to coordinate/synchronize when horizontal and vertical scaling states and decisions are kept in different places (i.e., HPA and VPA object)
+GKE's closed-source `MultidimPodAutoscaler` translates one MPA object into separate HPA and VPA objects and lets them run concurrently. Oscillation prevention is left to the operator through careful metric selection — it is not structural. The synchronizer solves the conflict regardless of metric configuration.
 
-### Google GKE's Approach of MPA
+### Configurable Priority / Alternating Token Model
 
-In this [alternative approach](https://cloud.google.com/kubernetes-engine/docs/how-to/multidimensional-pod-autoscaling) (non-open-sourced), a `MultidimPodAutoscaler` object modifies memory or/and CPU requests and adds replicas so that the average utilization of each replica matches your target utilization.
-The MPA object will be translated to VPA and HPA objects so at the end there are two *independent* controllers managing the vertical and horizontal scaling application deployment.
+This alternative describes a coordination model that does **not** assume HPA is always the higher-priority scaler. Instead, an MPA object holds a single exclusive token that it grants to exactly one scaler at a time, cycling through phases based on configurable rules.
+
+**Why this is appealing:**
+
+For workloads where VPA has genuine operational urgency (e.g., a memory-constrained batch job that must right-size before the next run), unconditional HPA priority is wrong. The alternating model gives each scaler a guaranteed window and allows the operator to express workload-specific priority explicitly.
+
+**Why this approach was not adopted:**
+
+The fundamental problem is that it requires **both scalers to agree on the same coordination protocol**. Specifically:
+
+1. **VPA `spec.paused` requires VPA-side support gated by the `MultidimPodAutoscaler` feature gate.** If the VPA is at a version that predates the feature gate, `spec.paused=true` is written to the VPA object but silently ignored — VPA continues acting as if it holds the token even when it doesn't. The token is broken.
+
+2. **Pausing HPA has no clean API primitive.** Unlike VPA (where `spec.paused` is new and purpose-built), there is no `hpa.spec.paused` field in the Kubernetes API. Pausing HPA in the alternating model would require either freezing replicas (`minReplicas = maxReplicas = currentReplicas`) — a destructive mutation of user-owned fields — or waiting for a future Kubernetes API addition. Either way, the symmetry assumption breaks down immediately.
+
+3. **Version skew is not recoverable without operator intervention.** In the HPA-priority reactive model, version skew between MPA and VPA is limited to the `spec.paused` field: if VPA doesn't check it, VPA simply runs freely — which is exactly what it did before MPA existed. The worst case is **the absence of protection**, not incorrect behavior. In the alternating model, version skew can cause **both scalers to believe they hold the token simultaneously** — which is worse than having no MPA at all.
+
+4. **Timer-based transitions introduce failure modes independent of version skew.** A settling timer can fire before the scaler has genuinely converged, opening a window where both scalers briefly act. The HPA status field (`currentReplicas == desiredReplicas`) is ground truth; a timer is an approximation.
+
+5. **Operator burden without proportional benefit.** For the vast majority of HPA + VPA workloads, the natural priority is clear: HPA handles burst, VPA handles right-sizing. Requiring the operator to configure `vpaActiveSeconds`, `settlingWindowSeconds`, and `priority` per workload adds surface area that can be misconfigured. The reactive model is correct by default.
+
+**In summary:** the alternating token model is technically coherent but requires a negotiated, version-matched contract between the MPA controller and both scaling controllers. The HPA-priority reactive model avoids this entirely — it requires agreement only from VPA (one side, one new field), and degrades safely when that agreement is absent.
+
+### Patching `updateMode=Off` Instead of `spec.paused`
+
+The simplest possible implementation would set `vpa.spec.updatePolicy.updateMode=Off` to suspend the VPA — this already causes the updater and admission controller to skip the VPA with zero new code in those components.
+
+This was rejected because:
+
+1. **Mutates user intent.** The user sets `updateMode` to express how they want VPA to operate (`Auto`, `Recreate`, `InPlace`, etc.). MPA overwriting this field is semantically incorrect and surprising.
+2. **Requires save/restore.** The original `updateMode` value must be saved (e.g., in an annotation) and restored exactly. This introduces failure modes: if the annotation is lost, the VPA is permanently stuck in `Off` mode.
+3. **No clear ownership.** There is no mechanism to prevent a user from changing `updateMode` while MPA is managing it, or from MPA overwriting a user's deliberate `Off` mode.
+
+The `spec.paused` field has none of these problems: it is independent of `updateMode`, has no value to save/restore, and is exclusively managed by MPA via field ownership.
+
+### VPA Status Condition Instead of `spec.paused`
+
+An alternative approach would use a VPA **status condition** (e.g., `MpaPauseRequested=True`) written by the MPA controller, with the VPA updater and admission controller polling that condition to determine whether to act.
+
+This was rejected because:
+
+1. **Status is not authoritative input.** The Kubernetes convention is that `status` reflects observed state written by the owning controller; it is not an input consumed by that same controller. Writing into `status` to influence behaviour creates an inverted ownership model that is confusing and error-prone.
+2. **No server-side apply semantics.** `spec` fields support field ownership via Server-Side Apply, allowing MPA to own exactly the `paused` field without touching anything else. Status conditions lack equivalent ownership primitives — two writers can conflict without a clear conflict-resolution path.
+3. **More code, no benefit.** The VPA updater and admission controller would still need to be modified to check the condition, just as they check `spec.paused`. Using `spec.paused` requires the same modifications with cleaner semantics.
+
+### Lease-Only Locking Without MPA Object
+
+Using a Kubernetes `Lease` as a distributed lock acquired by both the HPA and VPA controllers requires upstream changes to both — `kubernetes/kubernetes` for HPA and `kubernetes/autoscaler` for VPA — with no guarantee of acceptance. The `MultidimPodAutoscaler` CRD approach requires zero changes to HPA and only minimal, well-scoped changes to VPA.
