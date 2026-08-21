@@ -18,7 +18,7 @@ AEP - Autoscaler Enhancement Proposal
     - [Integration Tests](#integration-tests)
     - [End-to-end Tests](#end-to-end-tests)
 - [Risk and Mitigation](#risk-and-mitigation)
-  - [Race: spec.paused=true arrives after a pod has already been evicted](#race-specpausedtrue-arrives-after-a-pod-has-already-been-evicted)
+  - [Race: spec.pausedBy set arrives after a pod has already been evicted](#race-specpausedby-set-arrives-after-a-pod-has-already-been-evicted)
   - [Transient mixed-request fleet after HPA scale-out](#transient-mixed-request-fleet-after-hpa-scale-out)
   - [Multiple MPAs targeting the same workload](#multiple-mpas-targeting-the-same-workload)
 - [Production Readiness Review Questionnaire](#production-readiness-review-questionnaire)
@@ -65,7 +65,7 @@ Manual fine-tuning the timing to do vertical/horizontal scaling and prioritizati
 
 We propose a Multi-dimensional Pod Autoscaling (MPA) as a thin reactive synchronizer, fully decoupled from both HPA and VPA internals. The MPA API does not replace or wrap either controller. Instead, it considers the temporal relationship between the two scalers — HPA responds to sudden demand within seconds; VPA right-sizes over minutes to hours — and resolves their conflict without coupling MPA to either controller's internals.
 
-The MPA controller uses a newly introduced field `.spec.paused` on the VPA object to pause vertical scaling while HPA is actively scaling. This pause is gated by the `MultidimPodAutoscaler` feature gate. No other VPA internal logic changes.
+The MPA controller uses a newly introduced field `.spec.pausedBy` on the VPA object to pause vertical scaling while HPA is actively scaling. When `spec.pausedBy` is set, the VPA must be paused; when it is nil, actuation proceeds normally. This pause is gated by the `MultidimPodAutoscaler` feature gate. No other VPA internal logic changes.
 
 > [!NOTE]
 > The original AEP-5342 ([implemented in PR`#7550`](https://github.com/kubernetes/autoscaler/pull/7550)) built a monolithic Multi-dimensional Pod Autoscaler that subsumed HPA and VPA logic into a single controller. As discussed in [issue `#8493`](https://github.com/kubernetes/autoscaler/issues/8493#issuecomment-3246027731), the fundamental concern is long-term maintainability: any internal change to HPA or VPA must be tracked and replicated inside MPA, creating permanent coupling.
@@ -133,7 +133,7 @@ For certain workloads, to ensure a custom metric (e.g., throughput or request-se
 
 This enhancement introduces a new `MultidimPodAutoscaler` autoscaling API that coordinates multiple autoscaler objects targeting the same workload.
 
-The MPA controller auto-discovers all `VerticalPodAutoscaler` (VPA) and `HorizontalPodAutoscaler` (HPA) objects in the same namespace whose target reference matches `spec.targetRef`. It **always prioritizes HPA over VPA**: whenever any HPA is actively scaling (`currentReplicas != desiredReplicas`), all discovered VPAs are paused via `spec.paused=true`. MPA never modifies HPA.
+The MPA controller auto-discovers all `VerticalPodAutoscaler` (VPA) and `HorizontalPodAutoscaler` (HPA) objects in the same namespace whose target reference matches `spec.targetRef`. It **always prioritizes HPA over VPA**: whenever any HPA is actively scaling (`currentReplicas != desiredReplicas`), all discovered VPAs are paused by setting `spec.pausedBy` to a reference pointing to the managing MPA object. MPA never modifies HPA.
 
 When all HPAs are stable, VPA actuation resumes after `spec.stableDurationSeconds` to allow the fleet to settle before VPA begins evicting or resizing pods. When multiple VPAs target the same workload, only one VPA holds the active token at a time; it is re-evaluated after `spec.tokenHoldDurationSeconds` to allow other VPAs a turn. These two fields are the only tuning surface exposed by the MPA spec.
 
@@ -181,7 +181,7 @@ MPA is decoupled from both controllers:
 - All coordination state (active autoscaler, last transition time, discovered scalers) lives in the `MultidimPodAutoscaler` CR status.
 - It **watches** HPA status (`currentReplicas`, `desiredReplicas`) to determine whether any HPA is in-progress.
 - It **watches** VPA for prority and condition status to determine readiness and priority of each VPA.
-- It **pause or resume** VPA via its `spec.paused`.
+- It **pause or resume** VPA via its `spec.pausedBy` (set to an `MPARef` when pausing; cleared to nil when resuming).
 
 #### MultidimPodAutoscaler API
 
@@ -280,16 +280,35 @@ type AutoScalerRef struct {
 
 ### API Changes
 
-#### VPA API: `spec.paused` field
+#### VPA API: `spec.pausedBy` field
 
-A single boolean field `Paused` added to `VerticalPodAutoscalerSpec`:
+A structured reference field `PausedBy` is added to `VerticalPodAutoscalerSpec`. Presence of this field signals that actuation must be suspended; absence means the VPA runs freely. Using an object reference rather than a bare boolean makes the pause self-documenting (who set it and why) and avoids the ambiguity of a boolean with no ownership semantics.
 
 ```go
-// Paused suspends VPA actuation without stopping the recommender.
-// Managed by MultidimPodAutoscaler when the MultidimPodAutoscaler
+// PausedBy, when set, suspends VPA actuation (updater evictions and admission
+// controller resource injection) without stopping the recommender. The field
+// identifies the controller that owns the pause. A nil value means the VPA is
+// not paused. Managed by MultidimPodAutoscaler when the MultidimPodAutoscaler
 // feature gate is enabled. Do not set manually when an MPA is present.
 // +optional
-Paused bool `json:"paused,omitempty"`
+PausedBy *MPARef `json:"pausedBy,omitempty"`
+
+// MPARef is a reference to the MultidimPodAutoscaler object that has paused
+// this VPA. It carries enough information to identify the owner unambiguously
+// and to emit informative log / event messages.
+type MPARef struct {
+    // Name is the name of the MultidimPodAutoscaler object.
+    Name string `json:"name"`
+
+    // Namespace is the namespace of the MultidimPodAutoscaler object.
+    // Must equal the namespace of the VPA — included for diagnostic clarity.
+    Namespace string `json:"namespace"`
+
+    // UID is the UID of the MultidimPodAutoscaler object. Used to detect
+    // stale references left by a deleted-and-recreated MPA.
+    // +optional
+    UID types.UID `json:"uid,omitempty"`
+}
 ```
 
 ### MPA Controller Loop
@@ -318,11 +337,13 @@ Paused bool `json:"paused,omitempty"`
 
     Update `status.lastTransitionTime` whenever `status.activeAutoscaler` changes.
 
-4. **Pause enforcement.** All VPAs that are not the active autoscaler are paused by setting `.spec.paused=true`. When the active autoscaler is an HPA or nil-with-delay, all VPAs are paused.
+4. **Pause enforcement.** All VPAs that are not the active autoscaler are paused by setting `spec.pausedBy` to an `MPARef` pointing to the managing MPA. When the active autoscaler is an HPA or nil-with-delay, all VPAs are paused. When a VPA becomes the active autoscaler, `spec.pausedBy` is cleared to nil.
 
-### VPA `spec.paused` Field
+### VPA `spec.pausedBy` Field
 
-A new boolean field `Paused` is added to `VerticalPodAutoscalerSpec` (top-level). There is no equivalent `spec.paused` in the Kubernetes HPA API — this field is introduced specifically for MPA coordination and has no direct counterpart in the HPA type.
+A new reference field `PausedBy *MPARef` is added to `VerticalPodAutoscalerSpec` (top-level). There is no equivalent field in the Kubernetes HPA API — this field is introduced specifically for MPA coordination and has no direct counterpart in the HPA type.
+
+The semantics are deliberately **presence-based**: a non-nil `spec.pausedBy` means "this VPA is paused"; a nil value means "this VPA runs freely". This avoids the boolean anti-pattern where `false` is indistinguishable from "not yet set" and carries no ownership information.
 
 ```go
 // VerticalPodAutoscalerSpec is the specification of the behavior of the autoscaler.
@@ -333,60 +354,61 @@ type VerticalPodAutoscalerSpec struct {
     Recommenders []*VerticalPodAutoscalerRecommenderSelector `json:"recommenders,omitempty"`
     StartupBoost *StartupBoost                             `json:"startupBoost,omitempty"`
 
-    // Paused suspends VPA actuation (updater evictions and admission controller
-    // resource injection) without stopping the recommender. When true, the
-    // recommender continues accumulating metrics and updating recommendations,
+    // PausedBy, when non-nil, suspends VPA actuation (updater evictions and
+    // admission controller resource injection) without stopping the recommender.
+    // The recommender continues accumulating metrics and updating recommendations,
     // but no pods are evicted or resized.
     //
-    // This field is intended to be managed by an external controller such as
-    // MultidimPodAutoscaler. It MUST NOT be set manually when a
-    // MultidimPodAutoscaler is managing this VPA — use the MPA object instead.
+    // The value identifies the MultidimPodAutoscaler that owns the pause.
+    // This field MUST NOT be set manually when an MPA is managing this VPA —
+    // use the MPA object instead.
     //
     // Only effective when the MultidimPodAutoscaler feature gate is enabled.
     // +optional
-    Paused bool `json:"paused,omitempty"`
+    PausedBy *MPARef `json:"pausedBy,omitempty"`
 }
 ```
 
-**How VPA components respect `spec.paused`** (gated by `features.Enabled(features.MultidimPodAutoscaler)`):
+**How VPA components respect `spec.pausedBy`** (gated by `features.Enabled(features.MultidimPodAutoscaler)`):
 
-- **Updater** ([`updater.go:199`](pkg/updater/logic/updater.go)): adds a `spec.paused` check immediately after the existing `updateMode` filter. A paused VPA is skipped for the entire loop iteration — no evictions, no in-place resizes.
+- **Updater** ([`updater.go:199`](pkg/updater/logic/updater.go)): adds a `spec.pausedBy` check immediately after the existing `updateMode` filter. A paused VPA is skipped for the entire loop iteration — no evictions, no in-place resizes.
 
   ```go
   // After existing updateMode filter:
-  if features.Enabled(features.MultidimPodAutoscaler) && vpa.Spec.Paused {
-      klog.V(3).InfoS("Skipping VPA object because it is paused by MPA", "vpa", klog.KObj(vpa))
+  if features.Enabled(features.MultidimPodAutoscaler) && vpa.Spec.PausedBy != nil {
+      klog.V(3).InfoS("Skipping VPA object because it is paused by MPA",
+          "vpa", klog.KObj(vpa), "pausedBy", vpa.Spec.PausedBy.Name)
       continue
   }
   ```
 
-- **Admission controller** ([`matcher.go:78`](pkg/admission-controller/resource/vpa/matcher.go)): adds a `spec.paused` check alongside the existing `UpdateModeOff` skip.
+- **Admission controller** ([`matcher.go:78`](pkg/admission-controller/resource/vpa/matcher.go)): adds a `spec.pausedBy` check alongside the existing `UpdateModeOff` skip.
 
   ```go
-  if features.Enabled(features.MultidimPodAutoscaler) && vpaConfig.Spec.Paused {
+  if features.Enabled(features.MultidimPodAutoscaler) && vpaConfig.Spec.PausedBy != nil {
       continue
   }
   ```
 
-- **Recommender**: no change. The recommender does not check `spec.paused`. It continues building the historical model regardless of pause state, ensuring the VPA has a fresh recommendation ready the moment actuation resumes.
+- **Recommender**: no change. The recommender does not check `spec.pausedBy`. It continues building the historical model regardless of pause state, ensuring the VPA has a fresh recommendation ready the moment actuation resumes.
 
-- On deletion of the `MultidimPodAutoscaler`, a finalizer ensures `spec.paused` is set back to `false` before the MPA object is garbage-collected.
+- On deletion of the `MultidimPodAutoscaler`, a finalizer ensures `spec.pausedBy` is set back to `nil` before the MPA object is garbage-collected. Because the field carries the MPA's UID, a VPA whose `spec.pausedBy.uid` does not match any live MPA is treated as stale and automatically cleared by the controller on the next reconcile.
 
-> **Extended resource coverage** — because `spec.paused` gates the VPA updater and admission controller at their entry points, the pause applies uniformly to *all* resource dimensions the VPA manages: CPU, memory, and extended resources backed by Dynamic Resource Allocation. In the [`UpdateModeDRARecreate` mode](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate) (WIP), VPA patches `ResourceClaim` capacity at pod-creation time via the admission controller. When `spec.paused=true`, that ResourceClaim patch is also suppressed.
+> **Extended resource coverage** — because `spec.pausedBy` gates the VPA updater and admission controller at their entry points, the pause applies uniformly to *all* resource dimensions the VPA manages: CPU, memory, and extended resources backed by Dynamic Resource Allocation. In the [`UpdateModeDRARecreate` mode](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate) (WIP), VPA patches `ResourceClaim` capacity at pod-creation time via the admission controller. When `spec.pausedBy` is non-nil, that ResourceClaim patch is also suppressed.
 
 ## Risk and Mitigation
 
-### Race: `spec.paused=true` arrives after a pod has already been evicted
+### Race: `spec.pausedBy` set arrives after a pod has already been evicted
 
-There is a window between the VPA updater deciding to evict a pod and the `paused=true` patch being reflected in the updater's in-memory snapshot. If the patch lands while the updater is mid-loop and a pod has already been selected for eviction, that eviction will complete. If the admission controller cache is also stale at the moment the replacement pod is admitted, the VPA recommendation will be applied to the new pod — both outcomes are safe.
+There is a window between the VPA updater deciding to evict a pod and the `spec.pausedBy` patch being reflected in the updater's in-memory snapshot. If the patch lands while the updater is mid-loop and a pod has already been selected for eviction, that eviction will complete. If the admission controller cache is also stale at the moment the replacement pod is admitted, the VPA recommendation will be applied to the new pod — both outcomes are safe.
 
 For in-place mode (`UpdateModeInPlace` or `UpdateModeInPlaceOrRecreate`), no pod is deleted; the resize is applied by patching the pod's `/resize` subresource and negotiated by the kubelet. A pause arriving mid-resize leaves the pod running at the VPA-recommended values, which is acceptable.
 
-**Mitigation:** HPA does not report `desiredReplicas != currentReplicas` instantaneously — there is typically a 15–30 second stabilization window before HPA issues a scale. The MPA synchronizer patches `spec.paused=true` before HPA begins creating new pods, giving the VPA updater's current loop time to complete. Keeping vertical steps small further limits transient resource divergence across pods. To monitor the state, check `VPA.status.conditions` (eviction) and `pod.status.resize` (in-place resize) on pods whose VPA has `spec.paused=true`.
+**Mitigation:** HPA does not report `desiredReplicas != currentReplicas` instantaneously — there is typically a 15–30 second stabilization window before HPA issues a scale. The MPA synchronizer sets `spec.pausedBy` before HPA begins creating new pods, giving the VPA updater's current loop time to complete. Keeping vertical steps small further limits transient resource divergence across pods. To monitor the state, check `VPA.status.conditions` (eviction) and `pod.status.resize` (in-place resize) on pods whose VPA has a non-nil `spec.pausedBy`.
 
 ### Transient mixed-request fleet after HPA scale-out
 
-When VPA has right-sized some pods and HPA then scales out, new pods start at the pod template's original resource requests because `spec.paused=true` prevents the admission controller from applying the VPA recommendation. This creates a fleet with heterogeneous resource requests, which can skew the HPA utilization denominator and trigger a spurious extra scale step.
+When VPA has right-sized some pods and HPA then scales out, new pods start at the pod template's original resource requests because a non-nil `spec.pausedBy` prevents the admission controller from applying the VPA recommendation. This creates a fleet with heterogeneous resource requests, which can skew the HPA utilization denominator and trigger a spurious extra scale step.
 
 **Why this is bounded and acceptable:**
 
@@ -394,7 +416,7 @@ When VPA has right-sized some pods and HPA then scales out, new pods start at th
 
 2. **Over-provisioning is the correct bias during a burst.** Larger resource requests make `currentUtilization` appear lower, biasing HPA toward scale-out rather than scale-in — which is the right behavior under load.
 
-3. **The alternative is worse.** Leaving `spec.paused=false` so the admission controller patches new pods during an HPA scale-out re-introduces the concurrent VPA-eviction / HPA-scaling conflict that MPA exists to prevent.
+3. **The alternative is worse.** Leaving `spec.pausedBy=nil` so the admission controller patches new pods during an HPA scale-out re-introduces the concurrent VPA-eviction / HPA-scaling conflict that MPA exists to prevent.
 
 **Mitigation:** watch `kube_pod_container_resource_requests` grouped by workload — a non-zero spread between `min` and `max` requests indicates the fleet is mixed.
 
@@ -405,7 +427,7 @@ Nothing in the API prevents a user from creating two or more `MultidimPodAutosca
 **Why this is a problem:**
 
 - Each MPA evaluates its own `status.activeAutoscaler` and `status.lastTransitionTime` independently. One MPA may decide a VPA should be active (unpaused), while the other simultaneously decides it should be paused. The last writer wins on each API server round-trip, producing non-deterministic VPA pause state.
-- `spec.paused` is owned by whichever MPA most recently completed its patch. Server-Side Apply field ownership is per-manager, so both managers can own the same field and overwrite each other without conflict detection.
+- `spec.pausedBy` is owned by whichever MPA most recently completed its patch. Server-Side Apply field ownership is per-manager, so both managers can own the same field and overwrite each other without conflict detection.
 - The `tokenHoldDuration` token-rotation logic is meaningless under two competing state machines: neither MPA's timer reflects actual unpaused time for the VPA.
 
 **Mitigation — detection:**
@@ -413,7 +435,7 @@ Nothing in the API prevents a user from creating two or more `MultidimPodAutosca
 The MPA controller checks on each reconcile whether any other `MultidimPodAutoscaler` object in the same namespace shares its `spec.targetRef`. If a conflict is detected:
 
 1. The controller sets a `Degraded=True` status condition on the object with reason `ConflictingMPA` and a message listing the conflicting object names.
-2. No pause/unpause patches are issued while the condition is set — the controller backs off entirely to avoid making the race worse.
+2. No `spec.pausedBy` patches are issued while the condition is set — the controller backs off entirely to avoid making the race worse.
 3. The conflict is logged at warning level and surfaced via the `mpa_conflicting_target_total` Prometheus counter (labels: `namespace`, `target_kind`, `target_name`).
 
 The condition clears automatically once the conflict is resolved (the other MPA is deleted or its `spec.targetRef` is changed).
@@ -430,21 +452,21 @@ A validating admission webhook (part of the MPA admission controller) rejects `C
 
 #### Unit Tests
 
-- VPA updater and admission controller skip a paused VPA when the feature gate is enabled; neither skips it when the gate is disabled.
-- MPA pauses all VPAs when any HPA is scaling (`currentReplicas != desiredReplicas`), unpauses after `stableDurationSeconds`, and issues no patch when the state is already correct (idempotency).
-- `tokenHoldDurationSeconds` triggers VPA token re-evaluation; token is renewed without patching `spec.paused` when the winner is unchanged.
-- MPA deletion clears `spec.paused` on all managed VPAs via finalizer.
+- VPA updater and admission controller skip a VPA whose `spec.pausedBy` is non-nil when the feature gate is enabled; neither skips it when the gate is disabled.
+- MPA pauses all VPAs (sets `spec.pausedBy`) when any HPA is scaling (`currentReplicas != desiredReplicas`), clears `spec.pausedBy` after `stableDurationSeconds`, and issues no patch when the state is already correct (idempotency).
+- `tokenHoldDurationSeconds` triggers VPA token re-evaluation; token is renewed without patching `spec.pausedBy` when the winner is unchanged.
+- MPA deletion clears `spec.pausedBy` on all managed VPAs via finalizer.
 - `desiredReplicas=0` (HPA not yet evaluated) and missing HPA/VPA refs do not crash the controller and do not modify unrelated VPA objects.
 
 #### Integration Tests
 
-- Create a `MultidimPodAutoscaler`; set HPA `desiredReplicas > currentReplicas`; verify `vpa.spec.paused=true` is set within one reconcile interval.
-- Simulate HPA convergence; verify `vpa.spec.paused` is cleared after `stableDurationSeconds`.
+- Create a `MultidimPodAutoscaler`; set HPA `desiredReplicas > currentReplicas`; verify `vpa.spec.pausedBy` is set (pointing to the MPA) within one reconcile interval.
+- Simulate HPA convergence; verify `vpa.spec.pausedBy` is cleared (set to nil) after `stableDurationSeconds`.
 - With two VPAs, verify token rotates to the second VPA after `tokenHoldDurationSeconds` elapses.
-- Delete the `MultidimPodAutoscaler`; verify `vpa.spec.paused` is cleared and finalizer is removed.
-- Verify no patch is issued when `vpa.spec.paused` is already in the correct state (no spurious writes).
+- Delete the `MultidimPodAutoscaler`; verify `vpa.spec.pausedBy` is cleared and finalizer is removed.
+- Verify no patch is issued when `vpa.spec.pausedBy` is already in the correct state (no spurious writes).
 - Verify `vpa.spec.updatePolicy.updateMode` is never modified by MPA under any scenario.
-- Create two `MultidimPodAutoscaler` objects with the same `spec.targetRef`; verify the admission webhook rejects the second object. Bypass the webhook and verify both objects enter `Degraded=True / ConflictingMPA` and that no `vpa.spec.paused` patches are issued while the conflict persists. Delete one MPA and verify the remaining MPA clears its `Degraded` condition and resumes normal operation.
+- Create two `MultidimPodAutoscaler` objects with the same `spec.targetRef`; verify the admission webhook rejects the second object. Bypass the webhook and verify both objects enter `Degraded=True / ConflictingMPA` and that no `vpa.spec.pausedBy` patches are issued while the conflict persists. Delete one MPA and verify the remaining MPA clears its `Degraded` condition and resumes normal operation.
 
 #### End-to-End Tests
 
@@ -454,16 +476,16 @@ A validating admission webhook (part of the MPA admission controller) rejects `C
 
 ### Feature Enablement and Rollback
 
-- **Enabled:** the MPA Controller controller starts, watches `MultidimPodAutoscaler` objects, and manages `vpa.spec.paused`. The VPA updater and admission controller begin checking `spec.paused`.
-- **Disabled after being enabled:** the MPA Controller stops. Any VPA with `spec.paused=true` set by MPA retains that value. The VPA updater and admission controller **ignore** the field (gate is off) and resume actuation automatically — no manual cleanup required. However, the field remains set in the object until the MPA finalizer runs or the operator clears it.
+- **Enabled:** the MPA Controller starts, watches `MultidimPodAutoscaler` objects, and manages `vpa.spec.pausedBy`. The VPA updater and admission controller begin checking `spec.pausedBy`.
+- **Disabled after being enabled:** the MPA Controller stops. Any VPA with a non-nil `spec.pausedBy` set by MPA retains that value. The VPA updater and admission controller **ignore** the field (gate is off) and resume actuation automatically — no manual cleanup required. However, the field remains set in the object until the MPA finalizer runs or the operator clears it manually.
 
-Rollback is safe: `spec.paused` is idempotent. Setting it to `false` (or ignoring it when gate is off) has no side effects on running pods.
+Rollback is safe: clearing `spec.pausedBy` (or ignoring it when the gate is off) has no side effects on running pods.
 
 ### Graduation Criteria
 
 **Alpha:**
 - `MultidimPodAutoscaler` CRD available under the `MultidimPodAutoscaler` feature gate.
-- `vpa.spec.paused` field added; VPA updater and admission controller check it under the feature gate.
+- `vpa.spec.pausedBy` field added; VPA updater and admission controller check it under the feature gate.
 - Reactive synchronizer loop implemented and unit-tested.
 - Finalizer cleanup on MPA deletion implemented.
 - Integration tests pass.
@@ -481,7 +503,7 @@ Rollback is safe: `spec.paused` is idempotent. Setting it to `false` (or ignorin
 
 ### Version Skew
 
-The MPA Controller controller is a standalone binary. It only writes `vpa.spec.paused` on `VerticalPodAutoscaler` objects and reads `autoscaling/v2` HPA status. It does not interact with the VPA recommender, updater, or admission controller directly. Version skew between VPA components has no effect on the synchronizer — the `spec.paused` field is part of the persisted API object.
+The MPA Controller is a standalone binary. It only writes `vpa.spec.pausedBy` on `VerticalPodAutoscaler` objects and reads `autoscaling/v2` HPA status. It does not interact with the VPA recommender, updater, or admission controller directly. Version skew between VPA components has no effect on the synchronizer — the `spec.pausedBy` field is part of the persisted API object.
 
 ### Kubernetes Version Compatibility
 
@@ -492,7 +514,7 @@ No minimum Kubernetes version beyond what VPA already requires. The synchronizer
 ## Implementation History
 
 - 2024-08-20: initial reproposal — decoupled synchronizer model with configurable alternating priority
-- 2025-07-XX: revised to HPA-priority reactive model; removed configurable priority and initial phase; replaced `updateMode=Off` mechanism with new `vpa.spec.paused` field; introduced `stableDurationSeconds` (post-HPA settling delay before VPA resumes) and `tokenHoldDurationSeconds` (maximum time a single VPA holds the active token before re-evaluation); confirmed full decoupling — MPA never reads VPA internals, only writes one field; noted that coordination guarantee extends to DRA extended resources via `UpdateModeDRARecreate` ([NNNN-dra-recreate](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate))
+- 2025-07-XX: revised to HPA-priority reactive model; removed configurable priority and initial phase; replaced `updateMode=Off` mechanism with new `vpa.spec.pausedBy` reference field (replaces bare boolean `spec.paused`); introduced `stableDurationSeconds` (post-HPA settling delay before VPA resumes) and `tokenHoldDurationSeconds` (maximum time a single VPA holds the active token before re-evaluation); confirmed full decoupling — MPA never reads VPA internals, only writes one field; noted that coordination guarantee extends to DRA extended resources via `UpdateModeDRARecreate` ([NNNN-dra-recreate](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate))
 
 ---
 
@@ -518,11 +540,11 @@ For workloads where VPA has genuine operational urgency (e.g., a memory-constrai
 
 The fundamental problem is that it requires **both scalers to agree on the same coordination protocol**. Specifically:
 
-1. **VPA `spec.paused` requires VPA-side support gated by the `MultidimPodAutoscaler` feature gate.** If the VPA is at a version that predates the feature gate, `spec.paused=true` is written to the VPA object but silently ignored — VPA continues acting as if it holds the token even when it doesn't. The token is broken.
+1. **VPA `spec.pausedBy` requires VPA-side support gated by the `MultidimPodAutoscaler` feature gate.** If the VPA is at a version that predates the feature gate, `spec.pausedBy` is written to the VPA object but silently ignored — VPA continues acting as if it holds the token even when it doesn't. The token is broken.
 
-2. **Pausing HPA has no clean API primitive.** Unlike VPA (where `spec.paused` is new and purpose-built), there is no `hpa.spec.paused` field in the Kubernetes API. Pausing HPA in the alternating model would require either freezing replicas (`minReplicas = maxReplicas = currentReplicas`) — a destructive mutation of user-owned fields — or waiting for a future Kubernetes API addition. Either way, the symmetry assumption breaks down immediately.
+2. **Pausing HPA has no clean API primitive.** Unlike VPA (where `spec.pausedBy` is new and purpose-built), there is no equivalent `hpa.spec.pausedBy` field in the Kubernetes API. Pausing HPA in the alternating model would require either freezing replicas (`minReplicas = maxReplicas = currentReplicas`) — a destructive mutation of user-owned fields — or waiting for a future Kubernetes API addition. Either way, the symmetry assumption breaks down immediately.
 
-3. **Version skew is not recoverable without operator intervention.** In the HPA-priority reactive model, version skew between MPA and VPA is limited to the `spec.paused` field: if VPA doesn't check it, VPA simply runs freely — which is exactly what it did before MPA existed. The worst case is **the absence of protection**, not incorrect behavior. In the alternating model, version skew can cause **both scalers to believe they hold the token simultaneously** — which is worse than having no MPA at all.
+3. **Version skew is not recoverable without operator intervention.** In the HPA-priority reactive model, version skew between MPA and VPA is limited to the `spec.pausedBy` field: if VPA doesn't check it, VPA simply runs freely — which is exactly what it did before MPA existed. The worst case is **the absence of protection**, not incorrect behavior. In the alternating model, version skew can cause **both scalers to believe they hold the token simultaneously** — which is worse than having no MPA at all.
 
 4. **Timer-based transitions introduce failure modes independent of version skew.** A settling timer can fire before the scaler has genuinely converged, opening a window where both scalers briefly act. The HPA status field (`currentReplicas == desiredReplicas`) is ground truth; a timer is an approximation.
 
@@ -530,7 +552,7 @@ The fundamental problem is that it requires **both scalers to agree on the same 
 
 **In summary:** the alternating token model is technically coherent but requires a negotiated, version-matched contract between the MPA controller and both scaling controllers. The HPA-priority reactive model avoids this entirely — it requires agreement only from VPA (one side, one new field), and degrades safely when that agreement is absent.
 
-### Patching `updateMode=Off` Instead of `spec.paused`
+### Patching `updateMode=Off` Instead of `spec.pausedBy`
 
 The simplest possible implementation would set `vpa.spec.updatePolicy.updateMode=Off` to suspend the VPA — this already causes the updater and admission controller to skip the VPA with zero new code in those components.
 
@@ -540,17 +562,17 @@ This was rejected because:
 2. **Requires save/restore.** The original `updateMode` value must be saved (e.g., in an annotation) and restored exactly. This introduces failure modes: if the annotation is lost, the VPA is permanently stuck in `Off` mode.
 3. **No clear ownership.** There is no mechanism to prevent a user from changing `updateMode` while MPA is managing it, or from MPA overwriting a user's deliberate `Off` mode.
 
-The `spec.paused` field has none of these problems: it is independent of `updateMode`, has no value to save/restore, and is exclusively managed by MPA via field ownership.
+The `spec.pausedBy` reference field has none of these problems: it is independent of `updateMode`, has no value to save/restore, is exclusively managed by MPA via field ownership, and its presence unambiguously signals both the pause state and the owning controller.
 
-### VPA Status Condition Instead of `spec.paused`
+### VPA Status Condition Instead of `spec.pausedBy`
 
 An alternative approach would use a VPA **status condition** (e.g., `MpaPauseRequested=True`) written by the MPA controller, with the VPA updater and admission controller polling that condition to determine whether to act.
 
 This was rejected because:
 
 1. **Status is not authoritative input.** The Kubernetes convention is that `status` reflects observed state written by the owning controller; it is not an input consumed by that same controller. Writing into `status` to influence behaviour creates an inverted ownership model that is confusing and error-prone.
-2. **No server-side apply semantics.** `spec` fields support field ownership via Server-Side Apply, allowing MPA to own exactly the `paused` field without touching anything else. Status conditions lack equivalent ownership primitives — two writers can conflict without a clear conflict-resolution path.
-3. **More code, no benefit.** The VPA updater and admission controller would still need to be modified to check the condition, just as they check `spec.paused`. Using `spec.paused` requires the same modifications with cleaner semantics.
+2. **No server-side apply semantics.** `spec` fields support field ownership via Server-Side Apply, allowing MPA to own exactly the `pausedBy` field without touching anything else. Status conditions lack equivalent ownership primitives — two writers can conflict without a clear conflict-resolution path.
+3. **More code, no benefit.** The VPA updater and admission controller would still need to be modified to check the condition, just as they check `spec.pausedBy`. Using `spec.pausedBy` requires the same modifications with cleaner semantics.
 
 ### Lease-Only Locking Without MPA Object
 
