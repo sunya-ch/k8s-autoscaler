@@ -1,0 +1,14 @@
+apiVersion: autoscaling.x-k8s.io/v1alpha1
+kind: MultidimPodAutoscaler
+metadata:
+  name: hamster-mpa
+  namespace: mpa-demo
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hamster
+  # Wait 30 s after HPA stabilises before handing the token back to a VPA.
+  stableDurationSeconds: 30
+  # Each VPA may hold the active token for up to 5 min before re-evaluation.
+  tokenHoldDurationSeconds: 300

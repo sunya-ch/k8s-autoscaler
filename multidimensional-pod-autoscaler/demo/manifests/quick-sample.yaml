@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mpa-demo
+  labels:
+    purpose: mpa-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hamster
+  namespace: mpa-demo
+  labels:
+    app: hamster
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hamster
+  template:
+    metadata:
+      labels:
+        app: hamster
+    spec:
+      containers:
+      - name: hamster
+        image: registry.k8s.io/e2e-test-images/resource-consumer:1.14
+        ports:
+        - name: http
+          containerPort: 8080
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hamster-hpa
+  namespace: mpa-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hamster
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60
+---
+apiVersion: autoscaling.x-k8s.io/v1alpha1
+kind: MultidimPodAutoscaler
+metadata:
+  name: hamster-mpa
+  namespace: mpa-demo
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hamster
+  # Wait 30 s after HPA stabilises before handing the token back to a VPA.
+  stableDurationSeconds: 30
+  # Each VPA may hold the active token for up to 5 min before re-evaluation.
+  tokenHoldDurationSeconds: 300

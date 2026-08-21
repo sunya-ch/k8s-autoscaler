@@ -1,0 +1,24 @@
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: hamster-vpa-low
+  namespace: mpa-demo
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hamster
+  # priority 99 — lower priority; this VPA will be paused while hamster-vpa-high
+  # holds the token, then promoted when hamster-vpa-high is deleted.
+  priority: 99
+  updatePolicy:
+    updateMode: Recreate
+  resourcePolicy:
+    containerPolicies:
+    - containerName: hamster
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: "2"
+        memory: 2Gi

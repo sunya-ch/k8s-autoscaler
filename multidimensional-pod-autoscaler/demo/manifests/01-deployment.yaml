@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hamster
+  namespace: mpa-demo
+  labels:
+    app: hamster
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hamster
+  template:
+    metadata:
+      labels:
+        app: hamster
+    spec:
+      containers:
+      - name: hamster
+        # resource-consumer: lightweight HTTP server on port 8080.
+        # POST http://<pod>:8080/ConsumeCPU  body: millicores=<N>&durationSec=<T>
+        # POST http://<pod>:8080/ConsumeMem  body: megabytes=<N>&durationSec=<T>
+        image: registry.k8s.io/e2e-test-images/resource-consumer:1.14
+        ports:
+        - name: http
+          containerPort: 8080
+        resources:
+          requests:
+            # Deliberately low so the VPA recommender has room to suggest an
+            # increase after we drive CPU load, and the HPA has headroom to
+            # scale out when utilisation exceeds 60 %.
+            cpu: 100m
+            memory: 100Mi

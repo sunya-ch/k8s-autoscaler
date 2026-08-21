@@ -1,0 +1,114 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mpa-controller
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mpa-controller
+rules:
+- apiGroups: ["autoscaling.x-k8s.io"]
+  resources: ["multidimpodautoscalers", "multidimpodautoscalers/status"]
+  verbs: ["get", "list", "watch", "patch", "update"]
+- apiGroups: ["autoscaling.k8s.io"]
+  resources: ["verticalpodautoscalers"]
+  verbs: ["get", "list", "watch", "patch"]
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mpa-controller
+subjects:
+- kind: ServiceAccount
+  name: mpa-controller
+  namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: mpa-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+# Namespaced Role/RoleBinding for leader-election Leases only (least-privilege).
+# The Lease object lives in kube-system; a ClusterRole is not needed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mpa-controller-leader-election
+  namespace: kube-system
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mpa-controller-leader-election
+  namespace: kube-system
+subjects:
+- kind: ServiceAccount
+  name: mpa-controller
+  namespace: kube-system
+roleRef:
+  kind: Role
+  name: mpa-controller-leader-election
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mpa-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mpa-controller
+  template:
+    metadata:
+      labels:
+        app: mpa-controller
+    spec:
+      serviceAccountName: mpa-controller
+      containers:
+      - name: mpa-controller
+        image: mpa-controller:dev
+        imagePullPolicy: IfNotPresent
+        args:
+        - --leader-elect=true
+        - --metrics-bind-address=:8080
+        - --health-probe-bind-address=:8081
+        - --v=5
+        ports:
+        - name: metrics
+          containerPort: 8080
+        - name: healthz
+          containerPort: 8081
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+      terminationGracePeriodSeconds: 30
