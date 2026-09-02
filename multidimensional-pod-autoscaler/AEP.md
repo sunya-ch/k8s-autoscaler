@@ -12,6 +12,7 @@ AEP - Autoscaler Enhancement Proposal
   - [User Stories](#user-stories)
     - [A New MPA Framework with Reinforcement Learning](#a-new-mpa-framework-with-reinforcement-learning)
     - [Different Scaling Actions for Different Types of Resources](#different-scaling-actions-for-different-types-of-resources)
+    - [GPU Workloads](#gpu-workloads)
 - [Design Details](#design-details)
   - [Test Plan](#test-plan)
     - [Unit Tests](#unit-tests)
@@ -77,6 +78,8 @@ Currently, [HPA] and [VPA] work separately as independent controllers to determi
 - HPA determines the number of replicas for each Deployment of an application with the aim of automatically scaling the workload to match demand. The HPA controller, running within the Kubernetes control plane, periodically adjusts the desired scale of its target (e.g., a Deployment) to match observed metrics such as average CPU utilization, average memory utilization, or any other custom metric the users specify (e.g., the rate of client requests per second or I/O writes per second). The autoscaling algorithm that the HPA controller uses is based on the equation `desired_replicas = current_replicas * (current_metric_value / desired_metric_value)`.
 - VPA determines the size of containers, namely CPU and Memory Request and Limit. The primary goal of VPA is to reduce maintenance costs and improve the utilization of cluster resources. When configured, it will set the Request and Limit automatically based on historical usage and thus allow proper scheduling onto nodes so that the appropriate resource amount is available for each replica. It will also maintain ratios between limits and requests that were specified in the initial container configuration.
 
+GPU and other accelerator workloads intensify this conflict. A model-serving Deployment may use HPA to add GPU-backed replicas when per-replica queue depth rises, while a VPA (using [Dynamic Resource Allocation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) to manage `ResourceClaim` capacity) simultaneously tries to right-size the GPU memory slice of each pod. The VPA eviction — which recreates pods with adjusted `ResourceClaim` parameters — competes directly with HPA's scale-out, and GPU node capacity is typically far more constrained than CPU capacity, making the oscillation more disruptive and harder to recover from.
+
 When using HPA and VPA together to both reduce resource usage and guarantee application performance, VPA resizes pods based on their measured resource usage, and HPA scales in/out based on the customer application performance metric, and their logic is entirely ignorant of each other.
 Due to the independence of these two controllers, they can lead to an awkward situation where VPA tries to squeeze the pods into smaller sizes based on their measured utilization.
 Still, HPA tries to scale out the applications to improve the customized performance metrics.
@@ -126,6 +129,22 @@ Many studies in research show that combined horizontal and vertical scaling can 
 #### Different Scaling Actions for Different Types of Resources
 
 For certain workloads, to ensure a custom metric (e.g., throughput or request-serving latency), horizontal scaling typically controls the CPU resources effectively, and vertical scaling is typically effective in increasing or decreasing the allocated memory capacity per pod. Thus, there is a need to control different types of resources at the same time using different scaling actions. Existing VPA and HPA can control these separately. However, they cannot achieve the same objective, e.g., guarantee a custom metric within an SLO target, by controlling both dimensions with different resource types independently. For example, they can lead to an awkward situation where HPA tries to spin more pods based on the higher-than-threshold CPU usage while VPA tries to squeeze the size of each pod based on the lower memory usage (after scaling out by HPA). In the end, there will be a large number of small pods created for the workloads.
+
+#### GPU Workloads
+
+[Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) enables more dynamic management of extended devices such as GPUs. An example is the [HAMi DRA driver](https://github.com/Project-HAMi/HAMi), which provides fine-grained GPU allocation of both compute (cores) and memory per pod. VPA can target these parameters just as it targets CPU and memory requests, enabling vertical right-sizing of GPU resources alongside the existing horizontal scaling provided by HPA.
+
+##### Prefill-Decode Disaggregation
+
+LLM inference clusters disaggregate prefill and decode into separate Deployments sharing the same GPU node pool. Prefill and decode have fundamentally different GPU resource utilization characteristics: prefill is compute-bound while decode is memory-bandwidth-bound. Disaggregation makes right-sizing vital, since applying a single static GPU allocation to both roles wastes either compute or memory depending on which profile dominates.
+
+HPA scales each Deployment on token-traffic metrics — input tokens/s for prefill, active decode sequences for decode. Both roles react to the same traffic event but on different time horizons: during a burst, VPA may evict a prefill pod to apply a compute-reduction recommendation from a prior idle window exactly when HPA needs more prefill capacity. Independently, a decode VPA right-sizing KV-cache memory may evict decode pods mid-scale-out, dropping in-flight KV-cache state and forcing affected sequences back to the prefill stage. MPA prevents both by pausing all VPAs across both Deployments while any HPA is scaling, deferring right-sizing until the disaggregated fleet is stable.
+
+##### Multi-Tenant GPU Sharing with Continuous Batching
+
+Multiple tenants share the same GPU node pool through continuous batching, where a single pod processes requests from many users concurrently. A DRA driver partitions physical GPU compute and memory into per-pod `ResourceClaim` slices and enforces priority-based allocation. HPA scales replicas based on token-traffic load (e.g., queued tokens per pod). When HPA reaches the GPU node pool limit and no further horizontal scale-out is possible, VPA takes over as the vertical dimension: it reallocates `ResourceClaim` GPU compute and memory capacity across tenant pods according to workload priority, giving higher-priority tenants a larger share and shrinking lower-priority ones. Each pod's continuous-batching engine then adjusts its maximum batch size up to the newly available GPU resources, trading throughput proportionally to the share granted by VPA.
+
+MPA coordinates this hand-off: while HPA is still scaling (below the node-pool limit), it holds VPA back so that reallocation does not evict continuous-batching pods mid-burst. Once HPA stabilizes at the resource ceiling, VPA resumes and the DRA driver redistributes GPU compute and memory across the fleet according to tenant priority.
 
 ---
 
@@ -394,7 +413,7 @@ type VerticalPodAutoscalerSpec struct {
 
 - On deletion of the `MultidimPodAutoscaler`, a finalizer ensures `spec.pausedBy` is set back to `nil` before the MPA object is garbage-collected. Because the field carries the MPA's UID, a VPA whose `spec.pausedBy.uid` does not match any live MPA is treated as stale and automatically cleared by the controller on the next reconcile.
 
-> **Extended resource coverage** — because `spec.pausedBy` gates the VPA updater and admission controller at their entry points, the pause applies uniformly to *all* resource dimensions the VPA manages: CPU, memory, and extended resources backed by Dynamic Resource Allocation. In the [`UpdateModeDRARecreate` mode](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate) (WIP), VPA patches `ResourceClaim` capacity at pod-creation time via the admission controller. When `spec.pausedBy` is non-nil, that ResourceClaim patch is also suppressed.
+> **Extended resource and GPU coverage** — because `spec.pausedBy` gates the VPA updater and admission controller at their entry points, the pause applies uniformly to *all* resource dimensions the VPA manages: CPU, memory, and extended resources backed by Dynamic Resource Allocation — including GPU memory slices. In the [`UpdateModeDRARecreate` mode](https://github.com/sunya-ch/k8s-autoscaler/tree/dra-autoscaler/vertical-pod-autoscaler/enhancements/NNNN-dra-recreate) (WIP), VPA patches `ResourceClaim` capacity (e.g., GPU memory allocations provisioned via DRA device plugins) at pod-creation time via the admission controller. When `spec.pausedBy` is non-nil, that `ResourceClaim` patch is also suppressed, preventing GPU resource right-sizing from interfering with a concurrent HPA scale-out on GPU-backed workloads.
 
 ## Risk and Mitigation
 
@@ -471,6 +490,7 @@ A validating admission webhook (part of the MPA admission controller) rejects `C
 #### End-to-End Tests
 
 - Deploy a workload with HPA (CPU) and VPA (CPU + memory). Without `MultidimPodAutoscaler`, trigger a scale-out and observe VPA evictions disrupting it. With `MultidimPodAutoscaler`, repeat the same scale-out and confirm VPA does not evict any pods during the event.
+- **GPU workload scenario:** deploy a model-serving workload on a GPU node pool with HPA (custom metric: pending requests per pod) and a VPA managing GPU `ResourceClaim` capacity via `UpdateModeDRARecreate`. Trigger a simulated inference traffic spike; without MPA, confirm that VPA-initiated pod recreations (ResourceClaim patches) occur concurrently with HPA scale-out, causing capacity disruption. With `MultidimPodAutoscaler`, repeat the same spike and confirm no pod recreations are initiated by VPA while HPA is scaling; confirm VPA resumes and adjusts `ResourceClaim` capacity after `stableDurationSeconds` elapses.
 - Confirm `MultidimPodAutoscaler` status conditions reflect cluster state accurately across both phases.
 - Confirm deletion of `MultidimPodAutoscaler` leaves both HPA and VPA fully operational (VPA resumes actuation).
 
